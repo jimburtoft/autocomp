@@ -1,7 +1,7 @@
 #!/bin/bash
-# AutoComp optimization runner -- runs beam search on 3 internal kernels
+# AutoComp optimization runner -- runs beam search on internal kernels
 # Usage: bash run_optimize.sh [prob_id]
-#   If prob_id is provided, runs only that kernel. Otherwise runs all 3.
+#   If prob_id is provided, runs only that kernel. Otherwise runs all 4.
 
 set -e
 
@@ -16,14 +16,15 @@ cd /home/ubuntu/autocomp
 pip install -e . -q 2>/dev/null
 
 # Kernels to optimize:
-#   5 = FFT256 (177 LOC, no loops, transpose-heavy)
-#   6 = Mamba Scan (126 LOC, tensor_tensor_scan)
-#   4 = Triangular Multiply (100 LOC, batched matmul)
+#   8 = DeltaNet Recurrent (172 LOC, token-sequential, 5 nc_matmul per token)
+#   10 = OpenFold3 TriMul GEMM (53 LOC, tiled GEMM)
+#   12 = FlashVSR FP32 Attention (200 LOC, flash attn with FP32 softmax)
+#   15 = xpu-perf GEMM (80 LOC, tiled GEMM with non-aligned M)
 
 if [ -n "$1" ]; then
     KERNELS="$1"
 else
-    KERNELS="5 6 4"
+    KERNELS="8 10 12 15"
 fi
 
 # Warm-up: run each kernel's test harness once to trigger library rehydration
@@ -48,6 +49,10 @@ echo ""
 
 for PROB_ID in $KERNELS; do
     case $PROB_ID in
+        8) NAME="deltanet_recurrent" ;;
+        10) NAME="openfold3_trimul" ;;
+        12) NAME="flashvsr_fp32attn" ;;
+        15) NAME="gemm" ;;
         5) NAME="fft256" ;;
         6) NAME="mamba_scan" ;;
         4) NAME="trimul" ;;
