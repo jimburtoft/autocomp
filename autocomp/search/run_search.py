@@ -48,11 +48,14 @@ def main():
     # others via Converse API). No external API keys needed -- uses IAM role.
     # Claude models need "us." cross-region inference profile prefix.
     # Set AWS_REGION=us-east-1 for broadest model availability.
+    #
+    # Upgraded ensemble (2026-04-01): larger models for better optimization.
+    # Previous: Sonnet 3.5 + Sonnet 4 + Llama4 Maverick 17B + Mistral Large 675B
     models = [
-        "aws::us.anthropic.claude-sonnet-4-20250514-v1:0",
-        "aws::us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "aws::us.meta.llama4-maverick-17b-instruct-v1:0",
-        "aws::mistral.mistral-large-3-675b-instruct",
+        "aws::us.anthropic.claude-opus-4-5-20251101-v1:0",  # Opus 4.5 -- strongest reasoning
+        "aws::us.anthropic.claude-opus-4-6-v1",  # Opus 4.6 -- newest Opus
+        "aws::us.anthropic.claude-sonnet-4-6",  # Sonnet 4.6 -- latest Sonnet
+        "aws::mistral.devstral-2-123b",  # Devstral 2 -- code-specialized
     ]
     code_models = None  # None = same as planning models
 
