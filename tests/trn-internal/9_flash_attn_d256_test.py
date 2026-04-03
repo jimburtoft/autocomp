@@ -15,7 +15,7 @@ D_TILE = 128  # head_dim tile size (256 / 2)
 
 @nki.jit
 def ref(q, k, v, use_causal_mask=True):
-    """Reference flash attention for head_dim=256 (causal)."""
+    """Reference flash attention for head_dim=256 (causal), ISA-level style."""
     b, h, d, seqlen_q = q.shape
     _, k_h, _, seqlen_k = k.shape
     assert d == 256
@@ -48,15 +48,31 @@ def ref(q, k, v, use_causal_mask=True):
                     nisa.memset(l_acc, NEG_INF)
 
                     q_hbm = q[batch_id, head_id * q_h_per_k_h + i_q_h]
-                    q0 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16)
-                    q0[:, :] = (
-                        nl.load(q_hbm[nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)]) * scale
+
+                    # Load and scale q0
+                    q0_raw = nl.ndarray(
+                        (D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf
                     )
-                    q1 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16)
-                    q1[:, :] = (
-                        nl.load(q_hbm[nl.ds(D_TILE, D_TILE), nl.ds(qi * B_P, B_P)])
-                        * scale
+                    nisa.dma_copy(
+                        dst=q0_raw, src=q_hbm[nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)]
                     )
+                    q0_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(q0_f32, q0_raw, op0=nl.multiply, operand0=scale)
+                    q0 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=q0, src=q0_f32)
+
+                    # Load and scale q1
+                    q1_raw = nl.ndarray(
+                        (D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf
+                    )
+                    nisa.dma_copy(
+                        dst=q1_raw,
+                        src=q_hbm[nl.ds(D_TILE, D_TILE), nl.ds(qi * B_P, B_P)],
+                    )
+                    q1_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(q1_f32, q1_raw, op0=nl.multiply, operand0=scale)
+                    q1 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=q1, src=q1_f32)
 
                     for kvi in nl.sequential_range(n_kv_tiles):
                         if use_causal_mask:
@@ -65,35 +81,44 @@ def ref(q, k, v, use_causal_mask=True):
                             skip_condition = False
 
                         if not skip_condition:
+                            # Load K chunks
                             k0 = nl.ndarray(
-                                (nl.par_dim(D_TILE), B_F), dtype=nl.bfloat16
+                                (nl.par_dim(D_TILE), B_F),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
                             )
-                            k0[:, :] = nl.load(
-                                k[
+                            nisa.dma_copy(
+                                dst=k0,
+                                src=k[
                                     batch_id,
                                     head_id,
                                     nl.ds(0, D_TILE),
                                     nl.ds(kvi * B_F, B_F),
-                                ]
+                                ],
                             )
                             k1 = nl.ndarray(
-                                (nl.par_dim(D_TILE), B_F), dtype=nl.bfloat16
+                                (nl.par_dim(D_TILE), B_F),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
                             )
-                            k1[:, :] = nl.load(
-                                k[
+                            nisa.dma_copy(
+                                dst=k1,
+                                src=k[
                                     batch_id,
                                     head_id,
                                     nl.ds(D_TILE, D_TILE),
                                     nl.ds(kvi * B_F, B_F),
-                                ]
+                                ],
                             )
 
+                            # Tiled QK matmul (accumulates in psum)
                             qk = nl.ndarray(
                                 (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.psum
                             )
-                            qk[:, :] = nl.matmul(q0, k0, transpose_x=True)
-                            qk[:, :] += nl.matmul(q1, k1, transpose_x=True)
+                            nisa.nc_matmul(qk, q0, k0)
+                            nisa.nc_matmul(qk, q1, k1)
 
+                            # Move to SBUF with causal mask
                             qk_sbuf = nl.ndarray(
                                 (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.sbuf
                             )
@@ -103,108 +128,157 @@ def ref(q, k, v, use_causal_mask=True):
                                 q_pos = qi * B_P + i_q
                                 k_pos = kvi * B_F + i_k
                                 pred_causal = q_pos >= k_pos
-
-                                qk_sbuf[:, :] = nisa.affine_select(
+                                nisa.affine_select(
+                                    dst=qk_sbuf,
                                     pred=pred_causal,
                                     on_true_tile=qk,
                                     on_false_value=NEG_INF,
                                     dtype=nl.float32,
                                 )
                             else:
-                                qk_sbuf[:, :] = nl.copy(qk, dtype=nl.float32)
+                                nisa.tensor_copy(dst=qk_sbuf, src=qk)
 
-                            new_max = nisa.tensor_reduce(
-                                nl.max,
-                                qk_sbuf,
-                                axis=(1,),
-                                dtype=nl.float32,
-                                negate=False,
+                            # Row max
+                            new_max = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.tensor_reduce(new_max, nl.maximum, qk_sbuf, axis=1)
+
+                            # m_prev = copy(m_acc), m_acc = max(m_prev, new_max)
+                            m_prev = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.tensor_copy(dst=m_prev, src=m_acc)
+                            nisa.tensor_tensor(m_acc, m_prev, new_max, op=nl.maximum)
+
+                            # alpha = exp(m_prev - m_acc)
+                            alpha = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.activation(
+                                alpha, nl.exp, m_acc, bias=m_prev, scale=-1.0
                             )
 
-                            m_prev = nl.copy(m_acc[:, 0])
-                            m_acc[:, 0] = nl.maximum(m_prev, new_max)
-                            m_cur = m_acc[:, 0]
-
-                            alpha = nisa.activation(
-                                nl.exp, m_cur, bias=m_prev, scale=-1.0
+                            # Rescale o_acc *= alpha
+                            nisa.tensor_scalar(
+                                o_acc, o_acc, op0=nl.multiply, operand0=alpha
                             )
-                            o_acc[...] = nl.multiply(o_acc, alpha)
 
-                            p = nl.ndarray((nl.par_dim(B_P), B_F), dtype=nl.bfloat16)
-                            p_sum = nl.ndarray((nl.par_dim(B_P), 1), dtype=nl.float32)
-                            p[:, :] = nisa.activation_reduce(
-                                nl.exp,
-                                qk_sbuf,
-                                bias=-1 * m_cur,
+                            # exp(qk - max) and row sum
+                            p = nl.ndarray(
+                                (nl.par_dim(B_P), B_F),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
+                            )
+                            p_sum = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.activation_reduce(
+                                dst=p,
+                                act_fn=nl.exp,
+                                src=qk_sbuf,
+                                bias=-1.0 * m_acc,
                                 scale=1.0,
                                 reduce_op=nl.add,
-                                reduce_res=p_sum[:, 0],
+                                reduce_res=p_sum,
                                 dtype=nl.bfloat16,
                             )
 
+                            # Load V tiles
                             n_v_sub = B_F // B_P
                             v_tile = nl.ndarray(
-                                (n_v_sub, nl.par_dim(B_P), d), dtype=nl.bfloat16
+                                (n_v_sub, nl.par_dim(B_P), d),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
                             )
                             for vi in nl.affine_range(n_v_sub):
-                                v_tile[vi, :, :] = nl.load(
-                                    v[
+                                nisa.dma_copy(
+                                    dst=v_tile[vi],
+                                    src=v[
                                         batch_id,
                                         head_id,
                                         nl.ds(kvi * B_F + vi * B_P, B_P),
                                         :,
                                     ],
-                                    dtype=nl.bfloat16,
                                 )
 
-                            p_t = nl.ndarray((nl.par_dim(B_P), B_F), dtype=nl.bfloat16)
+                            # Transpose p for PV matmul
+                            p_t = nl.ndarray(
+                                (nl.par_dim(B_P), B_F),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
+                            )
                             for ti in nl.affine_range(B_F // B_P):
-                                p_t_tmp = nl.ndarray(
+                                p_t_psum = nl.ndarray(
                                     (nl.par_dim(B_P), B_P),
                                     dtype=nl.float32,
                                     buffer=nl.psum,
                                 )
-                                p_t_tmp[:, :] = nisa.nc_transpose(
-                                    p[:, nl.ds(ti * B_P, B_P)]
+                                nisa.nc_transpose(p_t_psum, p[:, nl.ds(ti * B_P, B_P)])
+                                p_t_chunk = nl.ndarray(
+                                    (nl.par_dim(B_P), B_P),
+                                    dtype=nl.bfloat16,
+                                    buffer=nl.sbuf,
                                 )
-                                p_t[:, nl.ds(ti * B_P, B_P)] = nl.copy(
-                                    p_t_tmp, dtype=nl.bfloat16
+                                nisa.tensor_copy(dst=p_t_chunk, src=p_t_psum)
+                                nisa.tensor_copy(
+                                    dst=p_t[:, nl.ds(ti * B_P, B_P)], src=p_t_chunk
                                 )
 
+                            # PV matmul
                             pv = nl.ndarray(
-                                (nl.par_dim(B_P), d),
-                                dtype=nl.float32,
-                                buffer=nl.psum,
+                                (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.psum
                             )
                             nisa.memset(pv, 0.0)
                             for vi in nl.affine_range(n_v_sub):
-                                pv[:, :] += nl.matmul(
-                                    p_t[:, nl.ds(vi * B_P, B_P)],
-                                    v_tile[vi, :, :],
-                                    transpose_x=True,
+                                nisa.nc_matmul(
+                                    pv, p_t[:, nl.ds(vi * B_P, B_P)], v_tile[vi]
                                 )
 
-                            o_acc[:, :] = nl.add(o_acc, pv)
-
-                            exp_l = nisa.activation(
-                                nl.exp, m_cur, bias=l_acc[:, 0], scale=-1.0
+                            # o_acc += pv
+                            pv_sbuf = nl.ndarray(
+                                (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.sbuf
                             )
-                            l_acc[:, 0] = nl.add(
-                                m_cur, nisa.activation(nl.log, exp_l, bias=p_sum[:, 0])
-                            )
+                            nisa.tensor_copy(dst=pv_sbuf, src=pv)
+                            nisa.tensor_tensor(o_acc, o_acc, pv_sbuf, op=nl.add)
 
-                    final_exp = nisa.activation(
-                        nl.exp, l_acc[:, 0], bias=m_acc[:, 0], scale=-1.0
+                            # Update log-sum-exp
+                            exp_l = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.activation(
+                                exp_l, nl.exp, m_acc, bias=l_acc, scale=-1.0
+                            )
+                            log_arg = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.tensor_tensor(log_arg, exp_l, p_sum, op=nl.add)
+                            log_val = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.activation(log_val, nl.log, log_arg)
+                            nisa.tensor_tensor(l_acc, m_acc, log_val, op=nl.add)
+
+                    # Final rescale and store
+                    final_exp = nl.ndarray(
+                        (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
                     )
-                    out = nl.multiply(o_acc, final_exp, dtype=nl.bfloat16)
-                    nl.store(
-                        o[
+                    nisa.activation(final_exp, nl.exp, l_acc, bias=m_acc, scale=-1.0)
+                    nisa.tensor_scalar(
+                        o_acc, o_acc, op0=nl.multiply, operand0=final_exp
+                    )
+                    out = nl.ndarray(
+                        (nl.par_dim(B_P), d), dtype=nl.bfloat16, buffer=nl.sbuf
+                    )
+                    nisa.tensor_copy(dst=out, src=o_acc)
+                    nisa.dma_copy(
+                        dst=o[
                             batch_id,
                             head_id * q_h_per_k_h + i_q_h,
                             nl.ds(qi * B_P, B_P),
                             :,
                         ],
-                        out,
+                        src=out,
                     )
 
     return o
@@ -215,7 +289,7 @@ def ref(q, k, v, use_causal_mask=True):
 
 @nki.jit
 def test(q, k, v, use_causal_mask=True):
-    """Test flash attention for head_dim=256 (causal)."""
+    """Test flash attention for head_dim=256 (causal), ISA-level style."""
     b, h, d, seqlen_q = q.shape
     _, k_h, _, seqlen_k = k.shape
     assert d == 256
@@ -248,15 +322,31 @@ def test(q, k, v, use_causal_mask=True):
                     nisa.memset(l_acc, NEG_INF)
 
                     q_hbm = q[batch_id, head_id * q_h_per_k_h + i_q_h]
-                    q0 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16)
-                    q0[:, :] = (
-                        nl.load(q_hbm[nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)]) * scale
+
+                    # Load and scale q0
+                    q0_raw = nl.ndarray(
+                        (D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf
                     )
-                    q1 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16)
-                    q1[:, :] = (
-                        nl.load(q_hbm[nl.ds(D_TILE, D_TILE), nl.ds(qi * B_P, B_P)])
-                        * scale
+                    nisa.dma_copy(
+                        dst=q0_raw, src=q_hbm[nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)]
                     )
+                    q0_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(q0_f32, q0_raw, op0=nl.multiply, operand0=scale)
+                    q0 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=q0, src=q0_f32)
+
+                    # Load and scale q1
+                    q1_raw = nl.ndarray(
+                        (D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf
+                    )
+                    nisa.dma_copy(
+                        dst=q1_raw,
+                        src=q_hbm[nl.ds(D_TILE, D_TILE), nl.ds(qi * B_P, B_P)],
+                    )
+                    q1_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(q1_f32, q1_raw, op0=nl.multiply, operand0=scale)
+                    q1 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=q1, src=q1_f32)
 
                     for kvi in nl.sequential_range(n_kv_tiles):
                         if use_causal_mask:
@@ -265,35 +355,44 @@ def test(q, k, v, use_causal_mask=True):
                             skip_condition = False
 
                         if not skip_condition:
+                            # Load K chunks
                             k0 = nl.ndarray(
-                                (nl.par_dim(D_TILE), B_F), dtype=nl.bfloat16
+                                (nl.par_dim(D_TILE), B_F),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
                             )
-                            k0[:, :] = nl.load(
-                                k[
+                            nisa.dma_copy(
+                                dst=k0,
+                                src=k[
                                     batch_id,
                                     head_id,
                                     nl.ds(0, D_TILE),
                                     nl.ds(kvi * B_F, B_F),
-                                ]
+                                ],
                             )
                             k1 = nl.ndarray(
-                                (nl.par_dim(D_TILE), B_F), dtype=nl.bfloat16
+                                (nl.par_dim(D_TILE), B_F),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
                             )
-                            k1[:, :] = nl.load(
-                                k[
+                            nisa.dma_copy(
+                                dst=k1,
+                                src=k[
                                     batch_id,
                                     head_id,
                                     nl.ds(D_TILE, D_TILE),
                                     nl.ds(kvi * B_F, B_F),
-                                ]
+                                ],
                             )
 
+                            # Tiled QK matmul
                             qk = nl.ndarray(
                                 (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.psum
                             )
-                            qk[:, :] = nl.matmul(q0, k0, transpose_x=True)
-                            qk[:, :] += nl.matmul(q1, k1, transpose_x=True)
+                            nisa.nc_matmul(qk, q0, k0)
+                            nisa.nc_matmul(qk, q1, k1)
 
+                            # Move to SBUF with causal mask
                             qk_sbuf = nl.ndarray(
                                 (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.sbuf
                             )
@@ -303,108 +402,152 @@ def test(q, k, v, use_causal_mask=True):
                                 q_pos = qi * B_P + i_q
                                 k_pos = kvi * B_F + i_k
                                 pred_causal = q_pos >= k_pos
-
-                                qk_sbuf[:, :] = nisa.affine_select(
+                                nisa.affine_select(
+                                    dst=qk_sbuf,
                                     pred=pred_causal,
                                     on_true_tile=qk,
                                     on_false_value=NEG_INF,
                                     dtype=nl.float32,
                                 )
                             else:
-                                qk_sbuf[:, :] = nl.copy(qk, dtype=nl.float32)
+                                nisa.tensor_copy(dst=qk_sbuf, src=qk)
 
-                            new_max = nisa.tensor_reduce(
-                                nl.max,
-                                qk_sbuf,
-                                axis=(1,),
-                                dtype=nl.float32,
-                                negate=False,
+                            # Row max
+                            new_max = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.tensor_reduce(new_max, nl.maximum, qk_sbuf, axis=1)
+
+                            m_prev = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.tensor_copy(dst=m_prev, src=m_acc)
+                            nisa.tensor_tensor(m_acc, m_prev, new_max, op=nl.maximum)
+
+                            alpha = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.activation(
+                                alpha, nl.exp, m_acc, bias=m_prev, scale=-1.0
                             )
 
-                            m_prev = nl.copy(m_acc[:, 0])
-                            m_acc[:, 0] = nl.maximum(m_prev, new_max)
-                            m_cur = m_acc[:, 0]
-
-                            alpha = nisa.activation(
-                                nl.exp, m_cur, bias=m_prev, scale=-1.0
+                            nisa.tensor_scalar(
+                                o_acc, o_acc, op0=nl.multiply, operand0=alpha
                             )
-                            o_acc[...] = nl.multiply(o_acc, alpha)
 
-                            p = nl.ndarray((nl.par_dim(B_P), B_F), dtype=nl.bfloat16)
-                            p_sum = nl.ndarray((nl.par_dim(B_P), 1), dtype=nl.float32)
-                            p[:, :] = nisa.activation_reduce(
-                                nl.exp,
-                                qk_sbuf,
-                                bias=-1 * m_cur,
+                            p = nl.ndarray(
+                                (nl.par_dim(B_P), B_F),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
+                            )
+                            p_sum = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.activation_reduce(
+                                dst=p,
+                                act_fn=nl.exp,
+                                src=qk_sbuf,
+                                bias=-1.0 * m_acc,
                                 scale=1.0,
                                 reduce_op=nl.add,
-                                reduce_res=p_sum[:, 0],
+                                reduce_res=p_sum,
                                 dtype=nl.bfloat16,
                             )
 
+                            # Load V tiles
                             n_v_sub = B_F // B_P
                             v_tile = nl.ndarray(
-                                (n_v_sub, nl.par_dim(B_P), d), dtype=nl.bfloat16
+                                (n_v_sub, nl.par_dim(B_P), d),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
                             )
                             for vi in nl.affine_range(n_v_sub):
-                                v_tile[vi, :, :] = nl.load(
-                                    v[
+                                nisa.dma_copy(
+                                    dst=v_tile[vi],
+                                    src=v[
                                         batch_id,
                                         head_id,
                                         nl.ds(kvi * B_F + vi * B_P, B_P),
                                         :,
                                     ],
-                                    dtype=nl.bfloat16,
                                 )
 
-                            p_t = nl.ndarray((nl.par_dim(B_P), B_F), dtype=nl.bfloat16)
+                            # Transpose p
+                            p_t = nl.ndarray(
+                                (nl.par_dim(B_P), B_F),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
+                            )
                             for ti in nl.affine_range(B_F // B_P):
-                                p_t_tmp = nl.ndarray(
+                                p_t_psum = nl.ndarray(
                                     (nl.par_dim(B_P), B_P),
                                     dtype=nl.float32,
                                     buffer=nl.psum,
                                 )
-                                p_t_tmp[:, :] = nisa.nc_transpose(
-                                    p[:, nl.ds(ti * B_P, B_P)]
+                                nisa.nc_transpose(p_t_psum, p[:, nl.ds(ti * B_P, B_P)])
+                                p_t_chunk = nl.ndarray(
+                                    (nl.par_dim(B_P), B_P),
+                                    dtype=nl.bfloat16,
+                                    buffer=nl.sbuf,
                                 )
-                                p_t[:, nl.ds(ti * B_P, B_P)] = nl.copy(
-                                    p_t_tmp, dtype=nl.bfloat16
+                                nisa.tensor_copy(dst=p_t_chunk, src=p_t_psum)
+                                nisa.tensor_copy(
+                                    dst=p_t[:, nl.ds(ti * B_P, B_P)], src=p_t_chunk
                                 )
 
+                            # PV matmul
                             pv = nl.ndarray(
-                                (nl.par_dim(B_P), d),
-                                dtype=nl.float32,
-                                buffer=nl.psum,
+                                (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.psum
                             )
                             nisa.memset(pv, 0.0)
                             for vi in nl.affine_range(n_v_sub):
-                                pv[:, :] += nl.matmul(
-                                    p_t[:, nl.ds(vi * B_P, B_P)],
-                                    v_tile[vi, :, :],
-                                    transpose_x=True,
+                                nisa.nc_matmul(
+                                    pv, p_t[:, nl.ds(vi * B_P, B_P)], v_tile[vi]
                                 )
 
-                            o_acc[:, :] = nl.add(o_acc, pv)
-
-                            exp_l = nisa.activation(
-                                nl.exp, m_cur, bias=l_acc[:, 0], scale=-1.0
+                            pv_sbuf = nl.ndarray(
+                                (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.sbuf
                             )
-                            l_acc[:, 0] = nl.add(
-                                m_cur, nisa.activation(nl.log, exp_l, bias=p_sum[:, 0])
-                            )
+                            nisa.tensor_copy(dst=pv_sbuf, src=pv)
+                            nisa.tensor_tensor(o_acc, o_acc, pv_sbuf, op=nl.add)
 
-                    final_exp = nisa.activation(
-                        nl.exp, l_acc[:, 0], bias=m_acc[:, 0], scale=-1.0
+                            # Update log-sum-exp
+                            exp_l = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.activation(
+                                exp_l, nl.exp, m_acc, bias=l_acc, scale=-1.0
+                            )
+                            log_arg = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.tensor_tensor(log_arg, exp_l, p_sum, op=nl.add)
+                            log_val = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.activation(log_val, nl.log, log_arg)
+                            nisa.tensor_tensor(l_acc, m_acc, log_val, op=nl.add)
+
+                    # Final rescale and store
+                    final_exp = nl.ndarray(
+                        (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
                     )
-                    out = nl.multiply(o_acc, final_exp, dtype=nl.bfloat16)
-                    nl.store(
-                        o[
+                    nisa.activation(final_exp, nl.exp, l_acc, bias=m_acc, scale=-1.0)
+                    nisa.tensor_scalar(
+                        o_acc, o_acc, op0=nl.multiply, operand0=final_exp
+                    )
+                    out = nl.ndarray(
+                        (nl.par_dim(B_P), d), dtype=nl.bfloat16, buffer=nl.sbuf
+                    )
+                    nisa.tensor_copy(dst=out, src=o_acc)
+                    nisa.dma_copy(
+                        dst=o[
                             batch_id,
                             head_id * q_h_per_k_h + i_q_h,
                             nl.ds(qi * B_P, B_P),
                             :,
                         ],
-                        out,
+                        src=out,
                     )
 
     return o
