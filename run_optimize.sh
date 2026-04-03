@@ -16,15 +16,12 @@ cd /home/ubuntu/autocomp
 pip install -e . -q 2>/dev/null
 
 # Kernels to optimize:
-#   8 = DeltaNet Recurrent (172 LOC, token-sequential, 5 nc_matmul per token)
-#   10 = OpenFold3 TriMul GEMM (53 LOC, tiled GEMM)
-#   12 = FlashVSR FP32 Attention (200 LOC, flash attn with FP32 softmax)
-#   15 = xpu-perf GEMM (80 LOC, tiled GEMM with non-aligned M)
+#   9 = Flash Attention d=256 (261 LOC, tiled QK matmul, causal mask, Qwen3.5)
 
 if [ -n "$1" ]; then
     KERNELS="$1"
 else
-    KERNELS="8 10 12 15"
+    KERNELS="9"
 fi
 
 # Warm-up: run each kernel's test harness once to trigger library rehydration
@@ -50,6 +47,7 @@ echo ""
 for PROB_ID in $KERNELS; do
     case $PROB_ID in
         8) NAME="deltanet_recurrent" ;;
+        9) NAME="flash_attn_d256" ;;
         10) NAME="openfold3_trimul" ;;
         12) NAME="flashvsr_fp32attn" ;;
         15) NAME="gemm" ;;

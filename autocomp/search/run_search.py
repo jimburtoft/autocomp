@@ -39,7 +39,7 @@ def main():
     hw_config = TrnHardwareConfig("trn2.3xlarge")
 
     prob_type = "trn-internal"  # Internal NKI kernels for optimization
-    prob_id = 5  # 5=fft256, 6=mamba_scan, 4=trimul (change per run)
+    prob_id = 9  # 9=flash_attn_d256 (change per run or via run_optimize.sh sed)
 
     # ------------------------------------------------------------------
     # Models -- Bedrock-only ensemble via IAM role
