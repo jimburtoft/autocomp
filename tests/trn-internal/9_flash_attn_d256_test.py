@@ -201,14 +201,15 @@ def ref(q, k, v, use_causal_mask=True):
 
                             # Load V tiles
                             n_v_sub = B_F // B_P
-                            v_tile = nl.ndarray(
-                                (n_v_sub, nl.par_dim(B_P), d),
-                                dtype=nl.bfloat16,
-                                buffer=nl.sbuf,
-                            )
-                            for vi in nl.affine_range(n_v_sub):
+                            v_tiles = []
+                            for vi in range(n_v_sub):
+                                vt = nl.ndarray(
+                                    (nl.par_dim(B_P), d),
+                                    dtype=nl.bfloat16,
+                                    buffer=nl.sbuf,
+                                )
                                 nisa.dma_copy(
-                                    dst=v_tile[vi],
+                                    dst=vt,
                                     src=v[
                                         batch_id,
                                         head_id,
@@ -216,6 +217,7 @@ def ref(q, k, v, use_causal_mask=True):
                                         :,
                                     ],
                                 )
+                                v_tiles.append(vt)
 
                             # Transpose p for PV matmul
                             p_t = nl.ndarray(
@@ -245,9 +247,9 @@ def ref(q, k, v, use_causal_mask=True):
                                 (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.psum
                             )
                             nisa.memset(pv, 0.0)
-                            for vi in nl.affine_range(n_v_sub):
+                            for vi in range(n_v_sub):
                                 nisa.nc_matmul(
-                                    pv, p_t[:, nl.ds(vi * B_P, B_P)], v_tile[vi]
+                                    pv, p_t[:, nl.ds(vi * B_P, B_P)], v_tiles[vi]
                                 )
 
                             # o_acc += pv
@@ -486,14 +488,15 @@ def test(q, k, v, use_causal_mask=True):
 
                             # Load V tiles
                             n_v_sub = B_F // B_P
-                            v_tile = nl.ndarray(
-                                (n_v_sub, nl.par_dim(B_P), d),
-                                dtype=nl.bfloat16,
-                                buffer=nl.sbuf,
-                            )
-                            for vi in nl.affine_range(n_v_sub):
+                            v_tiles = []
+                            for vi in range(n_v_sub):
+                                vt = nl.ndarray(
+                                    (nl.par_dim(B_P), d),
+                                    dtype=nl.bfloat16,
+                                    buffer=nl.sbuf,
+                                )
                                 nisa.dma_copy(
-                                    dst=v_tile[vi],
+                                    dst=vt,
                                     src=v[
                                         batch_id,
                                         head_id,
@@ -501,6 +504,7 @@ def test(q, k, v, use_causal_mask=True):
                                         :,
                                     ],
                                 )
+                                v_tiles.append(vt)
 
                             # Transpose p
                             p_t = nl.ndarray(
@@ -530,9 +534,9 @@ def test(q, k, v, use_causal_mask=True):
                                 (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.psum
                             )
                             nisa.memset(pv, 0.0)
-                            for vi in nl.affine_range(n_v_sub):
+                            for vi in range(n_v_sub):
                                 nisa.nc_matmul(
-                                    pv, p_t[:, nl.ds(vi * B_P, B_P)], v_tile[vi]
+                                    pv, p_t[:, nl.ds(vi * B_P, B_P)], v_tiles[vi]
                                 )
 
                             pv_sbuf = nl.ndarray(

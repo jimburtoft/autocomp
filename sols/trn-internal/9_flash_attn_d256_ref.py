@@ -246,13 +246,25 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                                 scale=1.0,
                             )
 
-                            # Load V: (n_v_sub, par_dim(B_P), d)
-                            n_v_sub = B_F // B_P
-                            v_tile = nl.ndarray(
-                                (n_v_sub, nl.par_dim(B_P), d),
-                                dtype=nl.bfloat16,
-                                buffer=nl.sbuf,
-                            )
+                            # Load V: 4 tiles of (par_dim(B_P), d) = (128, 256) each
+                            n_v_sub = B_F // B_P  # 4
+                            v_tiles = []
+                            for vi in range(n_v_sub):
+                                vt = nl.ndarray(
+                                    (nl.par_dim(B_P), d),
+                                    dtype=nl.bfloat16,
+                                    buffer=nl.sbuf,
+                                )
+                                nisa.dma_copy(
+                                    dst=vt,
+                                    src=v[
+                                        batch_id,
+                                        head_id,
+                                        nl.ds(kvi * B_F + vi * B_P, B_P),
+                                        :,
+                                    ],
+                                )
+                                v_tiles.append(vt)
                             for vi in nl.affine_range(n_v_sub):
                                 nisa.dma_copy(
                                     dst=v_tile[vi],
@@ -296,11 +308,11 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                                 (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.psum
                             )
                             nisa.memset(pv, 0.0)
-                            for vi in nl.affine_range(n_v_sub):
+                            for vi in range(n_v_sub):
                                 nisa.nc_matmul(
                                     pv,
                                     p_t[:, nl.ds(vi * B_P, B_P)],
-                                    v_tile[vi],
+                                    v_tiles[vi],
                                 )
 
                             # o_acc += pv (move pv from PSUM to SBUF first)
