@@ -228,18 +228,12 @@ def ref(q, k, v, use_causal_mask=True):
                             for ti in nl.affine_range(B_F // B_P):
                                 p_t_psum = nl.ndarray(
                                     (nl.par_dim(B_P), B_P),
-                                    dtype=nl.float32,
+                                    dtype=nl.bfloat16,
                                     buffer=nl.psum,
                                 )
                                 nisa.nc_transpose(p_t_psum, p[:, nl.ds(ti * B_P, B_P)])
-                                p_t_chunk = nl.ndarray(
-                                    (nl.par_dim(B_P), B_P),
-                                    dtype=nl.bfloat16,
-                                    buffer=nl.sbuf,
-                                )
-                                nisa.tensor_copy(dst=p_t_chunk, src=p_t_psum)
                                 nisa.tensor_copy(
-                                    dst=p_t[:, nl.ds(ti * B_P, B_P)], src=p_t_chunk
+                                    dst=p_t[:, nl.ds(ti * B_P, B_P)], src=p_t_psum
                                 )
 
                             # PV matmul
@@ -515,18 +509,12 @@ def test(q, k, v, use_causal_mask=True):
                             for ti in nl.affine_range(B_F // B_P):
                                 p_t_psum = nl.ndarray(
                                     (nl.par_dim(B_P), B_P),
-                                    dtype=nl.float32,
+                                    dtype=nl.bfloat16,
                                     buffer=nl.psum,
                                 )
                                 nisa.nc_transpose(p_t_psum, p[:, nl.ds(ti * B_P, B_P)])
-                                p_t_chunk = nl.ndarray(
-                                    (nl.par_dim(B_P), B_P),
-                                    dtype=nl.bfloat16,
-                                    buffer=nl.sbuf,
-                                )
-                                nisa.tensor_copy(dst=p_t_chunk, src=p_t_psum)
                                 nisa.tensor_copy(
-                                    dst=p_t[:, nl.ds(ti * B_P, B_P)], src=p_t_chunk
+                                    dst=p_t[:, nl.ds(ti * B_P, B_P)], src=p_t_psum
                                 )
 
                             # PV matmul
