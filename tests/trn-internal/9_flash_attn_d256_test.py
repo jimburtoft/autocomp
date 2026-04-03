@@ -35,13 +35,13 @@ def ref(q, k, v, use_causal_mask=True):
             for i_q_h in nl.affine_range(q_h_per_k_h):
                 for qi in nl.sequential_range(n_q_tiles):
                     o_acc = nl.zeros(
-                        (nl.par_dim(B_P), d), dtype=np.float32, buffer=nl.sbuf
+                        (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.sbuf
                     )
                     m_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=np.float32
+                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
                     )
                     l_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=np.float32
+                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
                     )
 
                     q_hbm = q[batch_id, head_id * q_h_per_k_h + i_q_h]
@@ -86,13 +86,13 @@ def ref(q, k, v, use_causal_mask=True):
                             )
 
                             qk = nl.ndarray(
-                                (nl.par_dim(B_P), B_F), dtype=np.float32, buffer=nl.psum
+                                (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.psum
                             )
                             qk[:, :] = nl.matmul(q0, k0, transpose_x=True)
                             qk[:, :] += nl.matmul(q1, k1, transpose_x=True)
 
                             qk_sbuf = nl.ndarray(
-                                (nl.par_dim(B_P), B_F), dtype=np.float32, buffer=nl.sbuf
+                                (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.sbuf
                             )
 
                             if use_causal_mask:
@@ -105,16 +105,16 @@ def ref(q, k, v, use_causal_mask=True):
                                     pred=pred_causal,
                                     on_true_tile=qk,
                                     on_false_value=NEG_INF,
-                                    dtype=np.float32,
+                                    dtype=nl.float32,
                                 )
                             else:
-                                qk_sbuf[:, :] = nl.copy(qk, dtype=np.float32)
+                                qk_sbuf[:, :] = nl.copy(qk, dtype=nl.float32)
 
                             new_max = nisa.tensor_reduce(
-                                np.max,
+                                nl.max,
                                 qk_sbuf,
                                 axis=(1,),
-                                dtype=np.float32,
+                                dtype=nl.float32,
                                 negate=False,
                             )
 
@@ -123,14 +123,14 @@ def ref(q, k, v, use_causal_mask=True):
                             m_cur = m_acc[:, 0]
 
                             alpha = nisa.activation(
-                                np.exp, m_cur, bias=m_prev, scale=-1.0
+                                nl.exp, m_cur, bias=m_prev, scale=-1.0
                             )
                             o_acc[...] = nl.multiply(o_acc, alpha)
 
                             p = nl.ndarray((nl.par_dim(B_P), B_F), dtype=nl.bfloat16)
-                            p_sum = nl.ndarray((nl.par_dim(B_P), 1), dtype=np.float32)
+                            p_sum = nl.ndarray((nl.par_dim(B_P), 1), dtype=nl.float32)
                             p[:, :] = nisa.activation_reduce(
-                                np.exp,
+                                nl.exp,
                                 qk_sbuf,
                                 bias=-1 * m_cur,
                                 scale=1.0,
@@ -158,7 +158,7 @@ def ref(q, k, v, use_causal_mask=True):
                             for ti in nl.affine_range(B_F // B_P):
                                 p_t_tmp = nl.ndarray(
                                     (nl.par_dim(B_P), B_P),
-                                    dtype=np.float32,
+                                    dtype=nl.float32,
                                     buffer=nl.psum,
                                 )
                                 p_t_tmp[:, :] = nisa.nc_transpose(
@@ -170,7 +170,7 @@ def ref(q, k, v, use_causal_mask=True):
 
                             pv = nl.zeros(
                                 (nl.par_dim(B_P), d),
-                                dtype=np.float32,
+                                dtype=nl.float32,
                                 buffer=nl.psum,
                                 lazy_initialization=True,
                             )
@@ -191,7 +191,7 @@ def ref(q, k, v, use_causal_mask=True):
                             )
 
                     final_exp = nisa.activation(
-                        np.exp, l_acc[:, 0], bias=m_acc[:, 0], scale=-1.0
+                        nl.exp, l_acc[:, 0], bias=m_acc[:, 0], scale=-1.0
                     )
                     out = nl.multiply(o_acc, final_exp, dtype=nl.bfloat16)
                     nl.store(
@@ -232,13 +232,13 @@ def test(q, k, v, use_causal_mask=True):
             for i_q_h in nl.affine_range(q_h_per_k_h):
                 for qi in nl.sequential_range(n_q_tiles):
                     o_acc = nl.zeros(
-                        (nl.par_dim(B_P), d), dtype=np.float32, buffer=nl.sbuf
+                        (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.sbuf
                     )
                     m_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=np.float32
+                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
                     )
                     l_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=np.float32
+                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
                     )
 
                     q_hbm = q[batch_id, head_id * q_h_per_k_h + i_q_h]
@@ -283,13 +283,13 @@ def test(q, k, v, use_causal_mask=True):
                             )
 
                             qk = nl.ndarray(
-                                (nl.par_dim(B_P), B_F), dtype=np.float32, buffer=nl.psum
+                                (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.psum
                             )
                             qk[:, :] = nl.matmul(q0, k0, transpose_x=True)
                             qk[:, :] += nl.matmul(q1, k1, transpose_x=True)
 
                             qk_sbuf = nl.ndarray(
-                                (nl.par_dim(B_P), B_F), dtype=np.float32, buffer=nl.sbuf
+                                (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.sbuf
                             )
 
                             if use_causal_mask:
@@ -302,16 +302,16 @@ def test(q, k, v, use_causal_mask=True):
                                     pred=pred_causal,
                                     on_true_tile=qk,
                                     on_false_value=NEG_INF,
-                                    dtype=np.float32,
+                                    dtype=nl.float32,
                                 )
                             else:
-                                qk_sbuf[:, :] = nl.copy(qk, dtype=np.float32)
+                                qk_sbuf[:, :] = nl.copy(qk, dtype=nl.float32)
 
                             new_max = nisa.tensor_reduce(
-                                np.max,
+                                nl.max,
                                 qk_sbuf,
                                 axis=(1,),
-                                dtype=np.float32,
+                                dtype=nl.float32,
                                 negate=False,
                             )
 
@@ -320,14 +320,14 @@ def test(q, k, v, use_causal_mask=True):
                             m_cur = m_acc[:, 0]
 
                             alpha = nisa.activation(
-                                np.exp, m_cur, bias=m_prev, scale=-1.0
+                                nl.exp, m_cur, bias=m_prev, scale=-1.0
                             )
                             o_acc[...] = nl.multiply(o_acc, alpha)
 
                             p = nl.ndarray((nl.par_dim(B_P), B_F), dtype=nl.bfloat16)
-                            p_sum = nl.ndarray((nl.par_dim(B_P), 1), dtype=np.float32)
+                            p_sum = nl.ndarray((nl.par_dim(B_P), 1), dtype=nl.float32)
                             p[:, :] = nisa.activation_reduce(
-                                np.exp,
+                                nl.exp,
                                 qk_sbuf,
                                 bias=-1 * m_cur,
                                 scale=1.0,
@@ -355,7 +355,7 @@ def test(q, k, v, use_causal_mask=True):
                             for ti in nl.affine_range(B_F // B_P):
                                 p_t_tmp = nl.ndarray(
                                     (nl.par_dim(B_P), B_P),
-                                    dtype=np.float32,
+                                    dtype=nl.float32,
                                     buffer=nl.psum,
                                 )
                                 p_t_tmp[:, :] = nisa.nc_transpose(
@@ -367,7 +367,7 @@ def test(q, k, v, use_causal_mask=True):
 
                             pv = nl.zeros(
                                 (nl.par_dim(B_P), d),
-                                dtype=np.float32,
+                                dtype=nl.float32,
                                 buffer=nl.psum,
                                 lazy_initialization=True,
                             )
@@ -388,7 +388,7 @@ def test(q, k, v, use_causal_mask=True):
                             )
 
                     final_exp = nisa.activation(
-                        np.exp, l_acc[:, 0], bias=m_acc[:, 0], scale=-1.0
+                        nl.exp, l_acc[:, 0], bias=m_acc[:, 0], scale=-1.0
                     )
                     out = nl.multiply(o_acc, final_exp, dtype=nl.bfloat16)
                     nl.store(

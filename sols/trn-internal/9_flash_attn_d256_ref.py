@@ -12,7 +12,6 @@ Layout:
   Output: (bs, n_heads, seq_q, 256) -- bfloat16
 """
 
-import numpy as np
 import nki
 import nki.language as nl
 import nki.isa as nisa
@@ -60,13 +59,13 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                 for qi in nl.sequential_range(n_q_tiles):
                     # Accumulators
                     o_acc = nl.zeros(
-                        (nl.par_dim(B_P), d), dtype=np.float32, buffer=nl.sbuf
+                        (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.sbuf
                     )
                     m_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=np.float32
+                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
                     )
                     l_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=np.float32
+                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
                     )
 
                     # Load Q tile: 2 chunks of (128, 128)
@@ -115,14 +114,14 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
 
                             # Tiled QK matmul: (128,128)^T @ (p128,512) -> (p128,512) accumulated
                             qk = nl.ndarray(
-                                (nl.par_dim(B_P), B_F), dtype=np.float32, buffer=nl.psum
+                                (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.psum
                             )
                             qk[:, :] = nl.matmul(q0, k0, transpose_x=True)
                             qk[:, :] += nl.matmul(q1, k1, transpose_x=True)
 
                             # Move to SBUF for masking
                             qk_sbuf = nl.ndarray(
-                                (nl.par_dim(B_P), B_F), dtype=np.float32, buffer=nl.sbuf
+                                (nl.par_dim(B_P), B_F), dtype=nl.float32, buffer=nl.sbuf
                             )
 
                             # Apply causal mask
@@ -136,17 +135,17 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                                     pred=pred_causal,
                                     on_true_tile=qk,
                                     on_false_value=NEG_INF,
-                                    dtype=np.float32,
+                                    dtype=nl.float32,
                                 )
                             else:
-                                qk_sbuf[:, :] = nl.copy(qk, dtype=np.float32)
+                                qk_sbuf[:, :] = nl.copy(qk, dtype=nl.float32)
 
                             # Row max
                             new_max = nisa.tensor_reduce(
-                                np.max,
+                                nl.max,
                                 qk_sbuf,
                                 axis=(1,),
-                                dtype=np.float32,
+                                dtype=nl.float32,
                                 negate=False,
                             )
 
@@ -156,15 +155,15 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
 
                             # Rescale previous output
                             alpha = nisa.activation(
-                                np.exp, m_cur, bias=m_prev, scale=-1.0
+                                nl.exp, m_cur, bias=m_prev, scale=-1.0
                             )
                             o_acc[...] = nl.multiply(o_acc, alpha)
 
                             # exp(qk - max) and row sum
                             p = nl.ndarray((nl.par_dim(B_P), B_F), dtype=nl.bfloat16)
-                            p_sum = nl.ndarray((nl.par_dim(B_P), 1), dtype=np.float32)
+                            p_sum = nl.ndarray((nl.par_dim(B_P), 1), dtype=nl.float32)
                             p[:, :] = nisa.activation_reduce(
-                                np.exp,
+                                nl.exp,
                                 qk_sbuf,
                                 bias=-1 * m_cur,
                                 scale=1.0,
@@ -194,7 +193,7 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                             for ti in nl.affine_range(B_F // B_P):
                                 p_t_tmp = nl.ndarray(
                                     (nl.par_dim(B_P), B_P),
-                                    dtype=np.float32,
+                                    dtype=nl.float32,
                                     buffer=nl.psum,
                                 )
                                 p_t_tmp[:, :] = nisa.nc_transpose(
@@ -207,7 +206,7 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                             # PV matmul: (B_P, B_F) @ (B_F, 256) -> (B_P, 256) in PSUM
                             pv = nl.zeros(
                                 (nl.par_dim(B_P), d),
-                                dtype=np.float32,
+                                dtype=nl.float32,
                                 buffer=nl.psum,
                                 lazy_initialization=True,
                             )
@@ -230,7 +229,7 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
 
                     # Final rescale and store
                     final_exp = nisa.activation(
-                        np.exp, l_acc[:, 0], bias=m_acc[:, 0], scale=-1.0
+                        nl.exp, l_acc[:, 0], bias=m_acc[:, 0], scale=-1.0
                     )
                     out = nl.multiply(o_acc, final_exp, dtype=nl.bfloat16)
                     nl.store(
