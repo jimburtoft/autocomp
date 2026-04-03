@@ -77,9 +77,8 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                     nisa.memset(l_acc, NEG_INF)
 
                     # Load Q tile: 2 chunks of (D_TILE, B_P)
-                    # Q layout: (bs, n_heads, 256, seq_q)
-                    # q_hbm[0:128, qi*128:(qi+1)*128] and q_hbm[128:256, qi*128:(qi+1)*128]
-                    q_hbm = q[batch_id, head_id * q_h_per_k_h + i_q_h]
+                    # Q layout: (bs, n_heads, 256, seq_q) -- index directly from q
+                    q_head = head_id * q_h_per_k_h + i_q_h
 
                     # Load q0 from HBM, then scale
                     q0_raw = nl.ndarray(
@@ -87,7 +86,7 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                     )
                     nisa.dma_copy(
                         dst=q0_raw,
-                        src=q_hbm[nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)],
+                        src=q[batch_id, q_head, nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)],
                     )
                     # Scale q0: upcast to fp32, multiply, downcast to bf16
                     q0_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
@@ -101,7 +100,12 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                     )
                     nisa.dma_copy(
                         dst=q1_raw,
-                        src=q_hbm[nl.ds(D_TILE, D_TILE), nl.ds(qi * B_P, B_P)],
+                        src=q[
+                            batch_id,
+                            q_head,
+                            nl.ds(D_TILE, D_TILE),
+                            nl.ds(qi * B_P, B_P),
+                        ],
                     )
                     q1_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_scalar(q1_f32, q1_raw, op0=nl.multiply, operand0=scale)

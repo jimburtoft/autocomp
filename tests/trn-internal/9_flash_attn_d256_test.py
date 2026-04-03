@@ -47,14 +47,15 @@ def ref(q, k, v, use_causal_mask=True):
                     )
                     nisa.memset(l_acc, NEG_INF)
 
-                    q_hbm = q[batch_id, head_id * q_h_per_k_h + i_q_h]
+                    q_head = head_id * q_h_per_k_h + i_q_h
 
                     # Load and scale q0
                     q0_raw = nl.ndarray(
                         (D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf
                     )
                     nisa.dma_copy(
-                        dst=q0_raw, src=q_hbm[nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)]
+                        dst=q0_raw,
+                        src=q[batch_id, q_head, nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)],
                     )
                     q0_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_scalar(q0_f32, q0_raw, op0=nl.multiply, operand0=scale)
@@ -67,7 +68,12 @@ def ref(q, k, v, use_causal_mask=True):
                     )
                     nisa.dma_copy(
                         dst=q1_raw,
-                        src=q_hbm[nl.ds(D_TILE, D_TILE), nl.ds(qi * B_P, B_P)],
+                        src=q[
+                            batch_id,
+                            q_head,
+                            nl.ds(D_TILE, D_TILE),
+                            nl.ds(qi * B_P, B_P),
+                        ],
                     )
                     q1_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_scalar(q1_f32, q1_raw, op0=nl.multiply, operand0=scale)
@@ -321,14 +327,15 @@ def test(q, k, v, use_causal_mask=True):
                     )
                     nisa.memset(l_acc, NEG_INF)
 
-                    q_hbm = q[batch_id, head_id * q_h_per_k_h + i_q_h]
+                    q_head = head_id * q_h_per_k_h + i_q_h
 
                     # Load and scale q0
                     q0_raw = nl.ndarray(
                         (D_TILE, B_P), dtype=nl.bfloat16, buffer=nl.sbuf
                     )
                     nisa.dma_copy(
-                        dst=q0_raw, src=q_hbm[nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)]
+                        dst=q0_raw,
+                        src=q[batch_id, q_head, nl.ds(0, D_TILE), nl.ds(qi * B_P, B_P)],
                     )
                     q0_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_scalar(q0_f32, q0_raw, op0=nl.multiply, operand0=scale)
@@ -341,7 +348,12 @@ def test(q, k, v, use_causal_mask=True):
                     )
                     nisa.dma_copy(
                         dst=q1_raw,
-                        src=q_hbm[nl.ds(D_TILE, D_TILE), nl.ds(qi * B_P, B_P)],
+                        src=q[
+                            batch_id,
+                            q_head,
+                            nl.ds(D_TILE, D_TILE),
+                            nl.ds(qi * B_P, B_P),
+                        ],
                     )
                     q1_f32 = nl.ndarray((D_TILE, B_P), dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_scalar(q1_f32, q1_raw, op0=nl.multiply, operand0=scale)
