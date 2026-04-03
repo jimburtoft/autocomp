@@ -34,15 +34,18 @@ def ref(q, k, v, use_causal_mask=True):
         for head_id in nl.affine_range(k_h):
             for i_q_h in nl.affine_range(q_h_per_k_h):
                 for qi in nl.sequential_range(n_q_tiles):
-                    o_acc = nl.zeros(
+                    o_acc = nl.ndarray(
                         (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.sbuf
                     )
-                    m_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
+                    nisa.memset(o_acc, 0.0)
+                    m_acc = nl.ndarray(
+                        (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
                     )
-                    l_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
+                    nisa.memset(m_acc, NEG_INF)
+                    l_acc = nl.ndarray(
+                        (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
                     )
+                    nisa.memset(l_acc, NEG_INF)
 
                     q_hbm = q[batch_id, head_id * q_h_per_k_h + i_q_h]
                     q0 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16)
@@ -168,12 +171,12 @@ def ref(q, k, v, use_causal_mask=True):
                                     p_t_tmp, dtype=nl.bfloat16
                                 )
 
-                            pv = nl.zeros(
+                            pv = nl.ndarray(
                                 (nl.par_dim(B_P), d),
                                 dtype=nl.float32,
                                 buffer=nl.psum,
-                                lazy_initialization=True,
                             )
+                            nisa.memset(pv, 0.0)
                             for vi in nl.affine_range(n_v_sub):
                                 pv[:, :] += nl.matmul(
                                     p_t[:, nl.ds(vi * B_P, B_P)],
@@ -231,15 +234,18 @@ def test(q, k, v, use_causal_mask=True):
         for head_id in nl.affine_range(k_h):
             for i_q_h in nl.affine_range(q_h_per_k_h):
                 for qi in nl.sequential_range(n_q_tiles):
-                    o_acc = nl.zeros(
+                    o_acc = nl.ndarray(
                         (nl.par_dim(B_P), d), dtype=nl.float32, buffer=nl.sbuf
                     )
-                    m_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
+                    nisa.memset(o_acc, 0.0)
+                    m_acc = nl.ndarray(
+                        (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
                     )
-                    l_acc = nl.full(
-                        (nl.par_dim(B_P), 1), fill_value=NEG_INF, dtype=nl.float32
+                    nisa.memset(m_acc, NEG_INF)
+                    l_acc = nl.ndarray(
+                        (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
                     )
+                    nisa.memset(l_acc, NEG_INF)
 
                     q_hbm = q[batch_id, head_id * q_h_per_k_h + i_q_h]
                     q0 = nl.ndarray((D_TILE, B_P), dtype=nl.bfloat16)
@@ -365,12 +371,12 @@ def test(q, k, v, use_causal_mask=True):
                                     p_t_tmp, dtype=nl.bfloat16
                                 )
 
-                            pv = nl.zeros(
+                            pv = nl.ndarray(
                                 (nl.par_dim(B_P), d),
                                 dtype=nl.float32,
                                 buffer=nl.psum,
-                                lazy_initialization=True,
                             )
+                            nisa.memset(pv, 0.0)
                             for vi in nl.affine_range(n_v_sub):
                                 pv[:, :] += nl.matmul(
                                     p_t[:, nl.ds(vi * B_P, B_P)],
