@@ -229,11 +229,18 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                             p_sum = nl.ndarray(
                                 (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
                             )
+                            # Pre-compute -m_acc (binary ops on tensors not supported)
+                            neg_m_acc = nl.ndarray(
+                                (nl.par_dim(B_P), 1), dtype=nl.float32, buffer=nl.sbuf
+                            )
+                            nisa.tensor_scalar(
+                                neg_m_acc, m_acc, op0=nl.multiply, operand0=-1.0
+                            )
                             nisa.activation_reduce(
                                 dst=p,
                                 act_fn=nl.exp,
                                 src=qk_sbuf,
-                                bias=-1.0 * m_acc,
+                                bias=neg_m_acc,
                                 scale=1.0,
                                 reduce_op=nl.add,
                                 reduce_res=p_sum,
