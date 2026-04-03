@@ -237,14 +237,13 @@ def flash_attn_d256(q, k, v, use_causal_mask=True):
                                 neg_m_acc, m_acc, op0=nl.multiply, operand0=-1.0
                             )
                             nisa.activation_reduce(
-                                dst=p,
-                                act_fn=nl.exp,
-                                src=qk_sbuf,
+                                p,
+                                nl.exp,
+                                qk_sbuf,
+                                nl.add,
+                                p_sum,
                                 bias=neg_m_acc,
                                 scale=1.0,
-                                reduce_op=nl.add,
-                                reduce_res=p_sum,
-                                dtype=nl.bfloat16,
                             )
 
                             # Load V: (n_v_sub, par_dim(B_P), d)
