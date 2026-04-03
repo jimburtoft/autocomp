@@ -130,16 +130,20 @@ def ref(q, k, v, use_causal_mask=True):
                             )
 
                             if use_causal_mask:
-                                i_q, i_k = nl.mgrid[0:B_P, 0:B_F]
-                                q_pos = qi * B_P + i_q
-                                k_pos = kvi * B_F + i_k
-                                pred_causal = q_pos >= k_pos
+                                qk_sbuf_raw = nl.ndarray(
+                                    (nl.par_dim(B_P), B_F),
+                                    dtype=nl.float32,
+                                    buffer=nl.sbuf,
+                                )
+                                nisa.tensor_copy(dst=qk_sbuf_raw, src=qk)
                                 nisa.affine_select(
                                     dst=qk_sbuf,
-                                    pred=pred_causal,
-                                    on_true_tile=qk,
+                                    pattern=[[0, 1], [0, 1], [0, 1], [-1, B_F]],
+                                    offset=qi * B_P - kvi * B_F,
+                                    channel_multiplier=1,
+                                    on_true_tile=qk_sbuf_raw,
                                     on_false_value=NEG_INF,
-                                    dtype=nl.float32,
+                                    cmp_op=nl.greater_equal,
                                 )
                             else:
                                 nisa.tensor_copy(dst=qk_sbuf, src=qk)
@@ -410,16 +414,20 @@ def test(q, k, v, use_causal_mask=True):
                             )
 
                             if use_causal_mask:
-                                i_q, i_k = nl.mgrid[0:B_P, 0:B_F]
-                                q_pos = qi * B_P + i_q
-                                k_pos = kvi * B_F + i_k
-                                pred_causal = q_pos >= k_pos
+                                qk_sbuf_raw = nl.ndarray(
+                                    (nl.par_dim(B_P), B_F),
+                                    dtype=nl.float32,
+                                    buffer=nl.sbuf,
+                                )
+                                nisa.tensor_copy(dst=qk_sbuf_raw, src=qk)
                                 nisa.affine_select(
                                     dst=qk_sbuf,
-                                    pred=pred_causal,
-                                    on_true_tile=qk,
+                                    pattern=[[0, 1], [0, 1], [0, 1], [-1, B_F]],
+                                    offset=qi * B_P - kvi * B_F,
+                                    channel_multiplier=1,
+                                    on_true_tile=qk_sbuf_raw,
                                     on_false_value=NEG_INF,
-                                    dtype=nl.float32,
+                                    cmp_op=nl.greater_equal,
                                 )
                             else:
                                 nisa.tensor_copy(dst=qk_sbuf, src=qk)
