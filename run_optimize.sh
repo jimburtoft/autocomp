@@ -16,12 +16,13 @@ cd /home/ubuntu/autocomp
 pip install -e . -q 2>/dev/null
 
 # Kernels to optimize:
-#   9 = Flash Attention d=256 (261 LOC, tiled QK matmul, causal mask, Qwen3.5)
+#   14 = LTX-2 Cross-Attention (610 LOC, masked cross-attn, bf16)
+#   11 = Whisper Megakernel (777 LOC, fused encoder layer, bf16)
 
 if [ -n "$1" ]; then
     KERNELS="$1"
 else
-    KERNELS="9"
+    KERNELS="14 11"
 fi
 
 # Warm-up: run each kernel's test harness once to trigger library rehydration
@@ -49,7 +50,9 @@ for PROB_ID in $KERNELS; do
         8) NAME="deltanet_recurrent" ;;
         9) NAME="flash_attn_d256" ;;
         10) NAME="openfold3_trimul" ;;
+        11) NAME="whisper_megakernel" ;;
         12) NAME="flashvsr_fp32attn" ;;
+        14) NAME="ltx2_crossattn" ;;
         15) NAME="gemm" ;;
         5) NAME="fft256" ;;
         6) NAME="mamba_scan" ;;
