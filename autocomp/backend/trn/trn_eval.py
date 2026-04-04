@@ -395,18 +395,34 @@ if __name__ == "__main__":
     import torch_xla
     from torch_xla.core import xla_model as xm
 
-    # ---- Fix NKI Beta 2 compilation caching ----
-    # Monkey-patch specialize_and_call to use deterministic KLR paths.
+    # ---- Fix NKI compilation caching ----
+    # Monkey-patch specialize_and_call to use deterministic temp paths.
     # Without this, every @nki.jit call recompiles (~1.3s) because the
     # random temp directory makes every XLA graph hash unique.
+    # SDK 2.28 removed output_path_prefix kwarg — we now override
+    # tempfile.mkstemp/NamedTemporaryFile prefix instead.
+    import tempfile as _tempfile
     from nki.compiler.backends.neuron.TraceKernel import TraceKernel
     _orig_specialize = TraceKernel.specialize_and_call
+    _orig_named_tmp = _tempfile.NamedTemporaryFile
 
-    def _patched_specialize(self, boundargs, output_path_prefix=None):
+    def _patched_specialize(self, boundargs):
         fn = getattr(self.func, "__name__", "kernel")
         sk = "".join(str(a.shape) + "_" for a in boundargs.args if hasattr(a, "shape"))
-        prefix = hashlib.md5(f"{fn}_{sk}".encode()).hexdigest()[:12]
-        return _orig_specialize(self, boundargs, output_path_prefix=prefix)
+        deterministic_prefix = hashlib.md5(f"{fn}_{sk}".encode()).hexdigest()[:12]
+        # Temporarily override NamedTemporaryFile to use deterministic prefix
+        # so the KLIR paths are stable across calls with same signature
+        def _det_named_tmp(*args, prefix=None, **kwargs):
+            if prefix is not None:
+                prefix = deterministic_prefix + "_" + prefix
+            else:
+                prefix = deterministic_prefix + "_"
+            return _orig_named_tmp(*args, prefix=prefix, **kwargs)
+        _tempfile.NamedTemporaryFile = _det_named_tmp
+        try:
+            return _orig_specialize(self, boundargs)
+        finally:
+            _tempfile.NamedTemporaryFile = _orig_named_tmp
 
     TraceKernel.specialize_and_call = _patched_specialize
 

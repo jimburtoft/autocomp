@@ -12,17 +12,19 @@ export WANDB_MODE=disabled
 
 cd /home/ubuntu/autocomp
 
+# Ensure output directory exists (fix for set -e + tee interaction)
+mkdir -p output
+
 # Install package if needed
 pip install -e . -q 2>/dev/null
 
 # Kernels to optimize:
-#   14 = LTX-2 Cross-Attention (610 LOC, masked cross-attn, bf16)
-#   11 = Whisper Megakernel (777 LOC, fused encoder layer, bf16)
+#   21 = Cross-Entropy Loss (316 LOC, online LSE, float32, nki-library)
 
 if [ -n "$1" ]; then
     KERNELS="$1"
 else
-    KERNELS="14 11"
+    KERNELS="21"
 fi
 
 # Warm-up: run each kernel's test harness once to trigger library rehydration
@@ -54,6 +56,7 @@ for PROB_ID in $KERNELS; do
         12) NAME="flashvsr_fp32attn" ;;
         14) NAME="ltx2_crossattn" ;;
         15) NAME="gemm" ;;
+        21) NAME="cross_entropy" ;;
         5) NAME="fft256" ;;
         6) NAME="mamba_scan" ;;
         4) NAME="trimul" ;;
