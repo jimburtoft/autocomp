@@ -32,7 +32,7 @@ def main():
     backend_name = (
         "trn"  # "gemmini", "trn", "tpu", "jaxbench", "kernelbench", "gpumode"
     )
-    agent_name = "trn-nki2"  # NKI 0.2.0 agent
+    agent_name = "trn-nki2"  # NKI 0.2.0+ agent (works with NKI 0.3.0 GA)
     simulator = (
         None  # "firesim"/"spike" for gemmini; "gpumode-local"/"gpumode-cli" for gpumode
     )

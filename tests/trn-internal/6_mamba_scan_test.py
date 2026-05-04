@@ -4,7 +4,6 @@ import torch
 import nki
 import nki.language as nl
 import nki.isa as nisa
-from torch_xla.core import xla_model as xm
 
 
 # ==============================================================================
@@ -316,7 +315,7 @@ def test_nki(ref_func, test_func):
 
     Uses small dimensions (NH=32, HD=4, SS=8, SL=16) for fast compilation.
     """
-    device = xm.xla_device()
+    device = torch.device("neuron")
 
     for seed in range(2):
         batch, seq_len, num_heads, head_dim, ssm_state_size = 1, 16, 32, 4, 8
@@ -393,7 +392,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Latency benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
 
     batch, seq_len, num_heads, head_dim, ssm_state_size = 1, 16, 32, 4, 8
     torch.manual_seed(42)

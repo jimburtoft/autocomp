@@ -44,8 +44,8 @@ def nki_matmul_kernel(a_t_hbm, b_hbm):
     M = a_t_hbm.shape[1]
     N = b_hbm.shape[1]
 
-    # Allocate output in HBM — this is returned to the XLA runtime
-    c_hbm = nl.ndarray((M, N), dtype=a_t_hbm.dtype, buffer=nl.hbm)
+    # Allocate output in shared HBM — required by NKI 0.3.0+ for kernel outputs
+    c_hbm = nl.ndarray((M, N), dtype=a_t_hbm.dtype, buffer=nl.shared_hbm)
 
     # Number of tiles along each dimension
     num_k_tiles = K // TILE_K

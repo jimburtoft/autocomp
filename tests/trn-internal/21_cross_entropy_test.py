@@ -15,7 +15,6 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 import torch
-from torch_xla.core import xla_model as xm
 
 
 # --- Inlined helpers ---
@@ -57,8 +56,8 @@ def _cross_entropy_body(
     num_batches = div_ceil(num_positions, positions_per_batch)
 
     # Output tensors in HBM (2D for DMA compatibility)
-    loss_hbm = nl.ndarray((num_positions, 1), dtype=dtype, buffer=nl.hbm)
-    lse_state_hbm = nl.ndarray((num_positions, 1), dtype=dtype, buffer=nl.hbm)
+    loss_hbm = nl.ndarray((num_positions, 1), dtype=dtype, buffer=nl.shared_hbm)
+    lse_state_hbm = nl.ndarray((num_positions, 1), dtype=dtype, buffer=nl.shared_hbm)
 
     # Pre-allocate SBUF buffers
     batch_targets = nl.ndarray((positions_per_batch, 1), dtype=nl.int32, buffer=nl.sbuf)
@@ -283,7 +282,7 @@ def cpu_reference(logits_np, targets_np):
 
 def test_nki(ref_func, test_func):
     """Correctness check: compare NKI ref, NKI test, and CPU reference."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
 
     num_positions = TEST_NUM_POSITIONS
     vocab_size = TEST_VOCAB_SIZE
@@ -341,7 +340,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Latency benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
 
     num_positions = TEST_NUM_POSITIONS
     vocab_size = TEST_VOCAB_SIZE

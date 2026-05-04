@@ -5,7 +5,6 @@ import nki
 import nki.language as nl
 import nki.isa as nisa
 import torch
-from torch_xla.core import xla_model as xm
 
 
 # Constants matching ref
@@ -668,7 +667,7 @@ def cpu_reference(q_ref, k_ref, v_ref, mask_ref):
 
 def test_nki(ref_func, test_func):
     """Correctness test: compare ref and test NKI kernels."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
 
     for seed in [42, 123]:
         np.random.seed(seed)
@@ -697,7 +696,7 @@ def test_nki(ref_func, test_func):
 
         ref_out_t = ref_func(q_t, k_t, v_t, mask_t)
         test_out_t = test_func(q_t, k_t, v_t, mask_t)
-        xm.mark_step()
+        torch.neuron.synchronize()
 
         ref_out = ref_out_t.cpu().float().numpy()
         test_out = test_out_t.cpu().float().numpy()
@@ -729,7 +728,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     np.random.seed(42)
 
     scale = 1.0 / math.sqrt(_XATTN_D)

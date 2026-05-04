@@ -5,7 +5,6 @@ import nki
 import nki.language as nl
 import nki.isa as nisa
 import torch
-from torch_xla.core import xla_model as xm
 
 
 # Tile size constants
@@ -306,7 +305,7 @@ def reference_attention_cpu(q, k, v, scale):
 
 def test_nki(ref_func, test_func):
     """Correctness check: compare ref and test vs CPU attention."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
 
     batch = 1
     seqlen_q = 512  # 4 Q tiles
@@ -365,7 +364,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Latency benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     batch = 1
     seqlen_q = 512
     seqlen_kv = 512

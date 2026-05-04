@@ -5,7 +5,6 @@ import nki
 import nki.language as nl
 import nki.isa as nisa
 import torch
-from torch_xla.core import xla_model as xm
 
 
 B_P = 128  # partition dim max
@@ -608,7 +607,7 @@ def reference_causal_attention_cpu(q, k, v):
 
 def test_nki(ref_func, test_func):
     """Correctness check: compare ref and test vs CPU causal attention."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
 
     bs = 1
     heads = 1
@@ -672,7 +671,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Latency benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     bs = 1
     heads = 1
     d = 256

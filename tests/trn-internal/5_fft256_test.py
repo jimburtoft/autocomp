@@ -8,7 +8,6 @@ import nki
 import nki.language as nl
 import nki.isa as nisa
 import torch
-from torch_xla.core import xla_model as xm
 
 
 def _compute_dft_matrix(N):
@@ -347,7 +346,7 @@ def ref(
 
 def test_nki(ref_func, test_func):
     """Correctness check: compare ref and test against numpy.fft.fft."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     H = 64
     W = 256
     TILE_H = 128
@@ -409,7 +408,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Latency benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     H = 128
     W = 256
     TILE_H = 128

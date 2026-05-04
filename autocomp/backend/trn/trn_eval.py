@@ -350,39 +350,34 @@ print(json.dumps({{"compiled": os.path.exists(_neff_path), "error": _error_msg}}
     def _evaluate_single(
         self, test_code: str, code_str: str, temp_dir: pathlib.Path, idx: int
     ) -> dict:
-        """Evaluate a single implementation in its own subprocess (fallback).
+        """Evaluate a single implementation in its own subprocess.
 
-        Patches the test script's __main__ block to use torch-based timing
-        instead of nki.benchmark (which is unavailable in SDK 2.28+).
+        Uses PyTorch Native (torch.device('neuron')) for device execution
+        and torch.neuron.synchronize() for timing synchronization.
+
+        On NKI 0.3.0 (GA), nki.benchmark may be available for true hardware
+        latency measurement. If not, falls back to wall-clock timing with
+        torch.neuron.synchronize() barriers.
         """
         test_code_i = test_code.replace("# SUBSTITUTE HERE", code_str)
 
-        # Replace the __main__ block with a torch-timing version that
-        # outputs "Latency: <ms> ms" to stdout.
+        # Replace the __main__ block with a PyTorch Native timing version
+        # that outputs "Latency: <ms> ms" to stdout.
         #
-        # Key design for accurate NKI kernel timing on SDK 2.28+:
+        # Key design for NKI 0.3.0 + PyTorch Native:
         #
-        # Problem: nki.benchmark is unavailable (NotImplementedError).
-        # NKI Beta 2 re-traces the kernel Python AST on every invocation
-        # and writes KLR binaries to random temp directories. The random
-        # path gets embedded in the XLA HLO graph hash, so the Neuron
-        # compilation cache never matches — causing full recompilation
-        # (~1.3s) on every call.
+        # PyTorch Native replaces the XLA-based torch-neuronx pipeline.
+        # Instead of xm.mark_step() + xm.wait_device_ops(), we use
+        # torch.neuron.synchronize() for device synchronization.
         #
-        # Solution (two-part):
-        # 1. Monkey-patch TraceKernel.specialize_and_call to use a
-        #    deterministic output_path_prefix based on kernel name +
-        #    input shapes. This makes the XLA graph hash stable, so
-        #    the Neuron compilation cache at /var/tmp/neuron-compile-cache/
-        #    can serve hits after the first call.
-        # 2. Monkey-patch nki.benchmark with a wrapper that uses
-        #    xm.mark_step() + xm.wait_device_ops() for accurate
-        #    wall-clock timing of cached kernel execution.
+        # NKI 0.3.0 (GA) should have nki.benchmark available for true
+        # hardware latency. We first try nki.benchmark; if it raises
+        # NotImplementedError, we fall back to wall-clock timing.
         #
-        # After patching: first call ~1-10s (compile), subsequent calls
-        # ~68ms (NKI trace overhead) + kernel execution time.
-        #
-        # See: OpencodeDocs/steering/nki.md "Beta 2 Compilation Caching Issue"
+        # The specialize_and_call caching monkey-patch is retained as a
+        # safety net — NKI 0.3.0 may still use random temp paths for KLR
+        # binaries. If the GA release fixes this, the patch is a harmless
+        # no-op. This needs to be verified on-instance.
         if "if __name__" in test_code_i:
             main_idx = test_code_i.index("if __name__")
             test_code_i = (
@@ -392,39 +387,38 @@ if __name__ == "__main__":
     import time
     import hashlib
     import torch
-    import torch_xla
-    from torch_xla.core import xla_model as xm
 
-    # ---- Fix NKI compilation caching ----
+    # ---- Fix NKI compilation caching (safety net) ----
     # Monkey-patch specialize_and_call to use deterministic temp paths.
-    # Without this, every @nki.jit call recompiles (~1.3s) because the
-    # random temp directory makes every XLA graph hash unique.
-    # SDK 2.28 removed output_path_prefix kwarg — we now override
-    # tempfile.mkstemp/NamedTemporaryFile prefix instead.
-    import tempfile as _tempfile
-    from nki.compiler.backends.neuron.TraceKernel import TraceKernel
-    _orig_specialize = TraceKernel.specialize_and_call
-    _orig_named_tmp = _tempfile.NamedTemporaryFile
+    # NKI 0.3.0 may fix this natively; if so this patch is a harmless no-op.
+    # Without this on NKI 0.2.0, every @nki.jit call recompiles (~1.3s)
+    # because random temp directories make each compilation cache key unique.
+    try:
+        import tempfile as _tempfile
+        from nki.compiler.backends.neuron.TraceKernel import TraceKernel
+        _orig_specialize = TraceKernel.specialize_and_call
+        _orig_named_tmp = _tempfile.NamedTemporaryFile
 
-    def _patched_specialize(self, boundargs):
-        fn = getattr(self.func, "__name__", "kernel")
-        sk = "".join(str(a.shape) + "_" for a in boundargs.args if hasattr(a, "shape"))
-        deterministic_prefix = hashlib.md5(f"{fn}_{sk}".encode()).hexdigest()[:12]
-        # Temporarily override NamedTemporaryFile to use deterministic prefix
-        # so the KLIR paths are stable across calls with same signature
-        def _det_named_tmp(*args, prefix=None, **kwargs):
-            if prefix is not None:
-                prefix = deterministic_prefix + "_" + prefix
-            else:
-                prefix = deterministic_prefix + "_"
-            return _orig_named_tmp(*args, prefix=prefix, **kwargs)
-        _tempfile.NamedTemporaryFile = _det_named_tmp
-        try:
-            return _orig_specialize(self, boundargs)
-        finally:
-            _tempfile.NamedTemporaryFile = _orig_named_tmp
+        def _patched_specialize(self, boundargs):
+            fn = getattr(self.func, "__name__", "kernel")
+            sk = "".join(str(a.shape) + "_" for a in boundargs.args if hasattr(a, "shape"))
+            deterministic_prefix = hashlib.md5(f"{fn}_{sk}".encode()).hexdigest()[:12]
+            def _det_named_tmp(*args, prefix=None, **kwargs):
+                if prefix is not None:
+                    prefix = deterministic_prefix + "_" + prefix
+                else:
+                    prefix = deterministic_prefix + "_"
+                return _orig_named_tmp(*args, prefix=prefix, **kwargs)
+            _tempfile.NamedTemporaryFile = _det_named_tmp
+            try:
+                return _orig_specialize(self, boundargs)
+            finally:
+                _tempfile.NamedTemporaryFile = _orig_named_tmp
 
-    TraceKernel.specialize_and_call = _patched_specialize
+        TraceKernel.specialize_and_call = _patched_specialize
+    except (ImportError, AttributeError):
+        # NKI 0.3.0 may have restructured TraceKernel — skip if not found
+        pass
 
     # Phase 1: Correctness check via test_nki (first calls compile)
     test_result = test_nki(ref, test)
@@ -434,73 +428,77 @@ if __name__ == "__main__":
     else:
         print("Test passed")
 
-    # Phase 2: Monkey-patch nki.benchmark, then call benchmark_nki(test)
-    # which creates the correct input tensors and calls the kernel.
-    # With the specialize_and_call patch above, the Neuron compilation
-    # cache now works — subsequent calls hit the cache (~68ms NKI trace
-    # overhead + actual kernel execution time).
-    class _LatencyResult:
-        def __init__(self, times_us):
-            self._times = sorted(times_us)
-        def get_latency_percentile(self, pct):
-            idx = int(len(self._times) * pct / 100.0)
-            idx = min(idx, len(self._times) - 1)
-            return self._times[idx]
+    # Phase 2: Benchmark using nki.benchmark (NKI 0.3.0 GA) or wall-clock fallback.
+    # First try the real nki.benchmark for true hardware latency.
+    # If unavailable, monkey-patch with PyTorch Native wall-clock timing
+    # using torch.neuron.synchronize() for accurate device synchronization.
+    _use_real_benchmark = False
+    try:
+        # Test if nki.benchmark actually works (not just importable)
+        @nki.benchmark(warmup=1, iters=1)
+        def _probe_benchmark(x_hbm):
+            pass
+        _use_real_benchmark = True
+        print("nki.benchmark: AVAILABLE (using true hardware latency)")
+    except (NotImplementedError, TypeError, Exception):
+        print("nki.benchmark: NOT AVAILABLE (using wall-clock fallback)")
 
-    class _BenchmarkResult:
-        def __init__(self, times_us):
-            self.nc_latency = _LatencyResult(times_us)
+    if not _use_real_benchmark:
+        class _LatencyResult:
+            def __init__(self, times_us):
+                self._times = sorted(times_us)
+            def get_latency_percentile(self, pct):
+                idx = int(len(self._times) * pct / 100.0)
+                idx = min(idx, len(self._times) - 1)
+                return self._times[idx]
 
-    class _BenchmarkWrapper:
-        def __init__(self, func, warmup, iters):
-            self._func = func
-            self._warmup = warmup
-            self._iters = iters
-            self.benchmark_result = None
+        class _BenchmarkResult:
+            def __init__(self, times_us):
+                self.nc_latency = _LatencyResult(times_us)
 
-        def __call__(self, *args, **kwargs):
-            device = torch_xla.device()
-            # Warmup: first call triggers compilation + cache save;
-            # subsequent warmup calls verify cache hits.
-            for _w in range(self._warmup + 3):
-                _out = self._func(*args, **kwargs)
-                xm.mark_step()
-            xm.wait_device_ops()
+        class _BenchmarkWrapper:
+            def __init__(self, func, warmup, iters):
+                self._func = func
+                self._warmup = warmup
+                self._iters = iters
+                self.benchmark_result = None
 
-            # Timed iterations with XLA synchronization.
-            # With the caching fix, each call is ~68ms NKI trace overhead
-            # + actual kernel execution (microseconds to milliseconds).
-            _num_iters = max(self._iters, 20)
-            times_us = []
-            for _i in range(_num_iters):
-                xm.wait_device_ops()
-                _t0 = time.perf_counter()
-                _out = self._func(*args, **kwargs)
-                xm.mark_step()
-                xm.wait_device_ops()
-                _t1 = time.perf_counter()
-                times_us.append((_t1 - _t0) * 1e6)  # microseconds
+            def __call__(self, *args, **kwargs):
+                # Warmup: first call triggers compilation + cache save;
+                # subsequent warmup calls verify cache hits.
+                for _w in range(self._warmup + 3):
+                    _out = self._func(*args, **kwargs)
+                torch.neuron.synchronize()
 
-            self.benchmark_result = _BenchmarkResult(times_us)
-            median_us = sorted(times_us)[len(times_us)//2]
-            p99_us = sorted(times_us)[int(len(times_us)*0.99)]
-            print(f"Latency: {median_us/1000.0:.3f} ms (median)")
-            print(f"Latency: {p99_us/1000.0:.3f} ms (P99)")
+                # Timed iterations with PyTorch Native synchronization.
+                _num_iters = max(self._iters, 20)
+                times_us = []
+                for _i in range(_num_iters):
+                    torch.neuron.synchronize()
+                    _t0 = time.perf_counter()
+                    _out = self._func(*args, **kwargs)
+                    torch.neuron.synchronize()
+                    _t1 = time.perf_counter()
+                    times_us.append((_t1 - _t0) * 1e6)  # microseconds
 
-    def _mock_benchmark(warmup=2, iters=10):
-        def _decorator(func):
-            return _BenchmarkWrapper(func, warmup, iters)
-        return _decorator
+                self.benchmark_result = _BenchmarkResult(times_us)
+                median_us = sorted(times_us)[len(times_us)//2]
+                p99_us = sorted(times_us)[int(len(times_us)*0.99)]
+                print(f"Latency: {median_us/1000.0:.3f} ms (median)")
+                print(f"Latency: {p99_us/1000.0:.3f} ms (P99)")
 
-    # Monkey-patch nki.benchmark
-    nki.benchmark = _mock_benchmark
+        def _mock_benchmark(warmup=2, iters=10):
+            def _decorator(func):
+                return _BenchmarkWrapper(func, warmup, iters)
+            return _decorator
+
+        # Monkey-patch nki.benchmark
+        nki.benchmark = _mock_benchmark
 
     try:
         if 'benchmark_nki' in dir():
             benchmark_nki(test)
         else:
-            # No benchmark_nki function — fall back to test_nki-based timing
-            # This is less accurate but better than nothing
             raise RuntimeError("No benchmark_nki function available")
     except Exception as e:
         import traceback
@@ -662,11 +660,11 @@ if __name__ == "__main__":
         test_code = test_file.read_text()
 
         results = None
-        # Combined evaluation (Phase 1 + Phase 2) requires nki.baremetal
-        # which is not available in SDK 2.28+. Skip directly to individual
-        # evaluation which uses monkey-patched nki.benchmark for timing.
-        # TODO: Re-enable when nki.baremetal support returns or when we
-        # implement a torch-based NEFF extraction alternative.
+        # Combined evaluation (Phase 1 + Phase 2) requires nki.baremetal.
+        # On SDK 2.29 / NKI 0.3.0, nki.baremetal may be available — needs
+        # on-instance verification. For now, skip to individual evaluation
+        # which uses nki.benchmark (if available) or wall-clock timing.
+        # TODO: Re-enable when nki.baremetal support is confirmed on NKI 0.3.0.
         if False and self.parallel:
             results = self._try_combined_evaluation(test_code, code_strs, temp_dir)
         if results is not None:
@@ -674,7 +672,7 @@ if __name__ == "__main__":
 
         if self.parallel:
             logger.info(
-                "Using individual evaluation (combined evaluation disabled for SDK 2.28+)"
+                "Using individual evaluation (combined evaluation disabled pending nki.baremetal verification)"
             )
         results = []
         for i, code_str in enumerate(code_strs):

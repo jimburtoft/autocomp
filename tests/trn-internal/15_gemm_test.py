@@ -5,7 +5,6 @@ import nki
 import nki.language as nl
 import nki.isa as nisa
 import torch
-from torch_xla.core import xla_model as xm
 
 
 # Hardware tile limits for NeuronCore-v3
@@ -32,7 +31,7 @@ def test(a_t_hbm, b_hbm):
     M = a_t_hbm.shape[1]
     N = b_hbm.shape[1]
 
-    c_hbm = nl.ndarray((M, N), dtype=a_t_hbm.dtype, buffer=nl.hbm)
+    c_hbm = nl.ndarray((M, N), dtype=a_t_hbm.dtype, buffer=nl.shared_hbm)
 
     num_k_tiles = K // TILE_K
     num_m_tiles = (M + TILE_M - 1) // TILE_M
@@ -94,7 +93,7 @@ def ref(a_t_hbm, b_hbm):
     M = a_t_hbm.shape[1]
     N = b_hbm.shape[1]
 
-    c_hbm = nl.ndarray((M, N), dtype=a_t_hbm.dtype, buffer=nl.hbm)
+    c_hbm = nl.ndarray((M, N), dtype=a_t_hbm.dtype, buffer=nl.shared_hbm)
 
     num_k_tiles = K // TILE_K
     num_m_tiles = (M + TILE_M - 1) // TILE_M
@@ -151,7 +150,7 @@ def ref(a_t_hbm, b_hbm):
 
 def test_nki(ref_func, test_func):
     """Correctness check: compare ref and test vs CPU matmul."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
 
     # Test shape: M=128, K=1024, N=1024 (all tile-aligned)
     M, K, N = 128, 1024, 1024
@@ -205,7 +204,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Latency benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     M, K, N = 128, 1024, 1024
 
     np.random.seed(42)

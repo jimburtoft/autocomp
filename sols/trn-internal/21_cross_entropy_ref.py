@@ -49,8 +49,8 @@ def _cross_entropy_body(
     num_chunks = div_ceil(vocab_size, chunk_size)
     num_batches = div_ceil(num_positions, positions_per_batch)
 
-    loss_hbm = nl.ndarray((num_positions, 1), dtype=dtype, buffer=nl.hbm)
-    lse_state_hbm = nl.ndarray((num_positions, 1), dtype=dtype, buffer=nl.hbm)
+    loss_hbm = nl.ndarray((num_positions, 1), dtype=dtype, buffer=nl.shared_hbm)
+    lse_state_hbm = nl.ndarray((num_positions, 1), dtype=dtype, buffer=nl.shared_hbm)
 
     # Pre-allocate SBUF buffers
     batch_targets = nl.ndarray((positions_per_batch, 1), dtype=nl.int32, buffer=nl.sbuf)

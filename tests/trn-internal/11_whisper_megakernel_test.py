@@ -5,7 +5,6 @@ import nki
 import nki.language as nl
 import nki.isa as nisa
 import torch
-from torch_xla.core import xla_model as xm
 
 
 # Constants matching the ref kernel
@@ -1005,7 +1004,7 @@ def _to_device(inputs, device):
 
 def test_nki(ref_func, test_func):
     """Correctness: compare ref NKI kernel vs test NKI kernel (and vs CPU)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
 
     for seed in [42, 123]:
         inputs = _make_inputs(seed)
@@ -1015,7 +1014,7 @@ def test_nki(ref_func, test_func):
 
         ref_out_t = ref_func(*dev_inputs, n_seq_tiles=TEST_N_SEQ_TILES)
         test_out_t = test_func(*dev_inputs, n_seq_tiles=TEST_N_SEQ_TILES)
-        xm.mark_step()
+        torch.neuron.synchronize()
 
         ref_out = ref_out_t.cpu().float().numpy()
         test_out = test_out_t.cpu().float().numpy()
@@ -1047,7 +1046,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     inputs = _make_inputs(42)
     dev_inputs = _to_device(inputs, device)
 

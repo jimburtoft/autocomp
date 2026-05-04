@@ -1,12 +1,17 @@
 #!/bin/bash
 # AutoComp optimization runner -- runs beam search on internal kernels
 # Usage: bash run_optimize.sh [prob_id]
-#   If prob_id is provided, runs only that kernel. Otherwise runs all 4.
+#   If prob_id is provided, runs only that kernel. Otherwise runs all listed.
+#
+# Environment: PyTorch Native (TorchNeuron) Beta 2 + NKI 0.3.0 (GA)
+# Setup: Follow PyTorch Native setup guide in AGENTS.md (extract DLC,
+#         install host runtime, create venv from workspace wheels)
 
 set -e
 
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
-export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+# PyTorch Native venv (created from DLC workspace wheels)
+# See AGENTS.md "PyTorch Native (TorchNeuron) Setup Guide" for setup.
+source $HOME/workspace/native_venv/bin/activate
 export AWS_REGION=us-east-1
 export WANDB_MODE=disabled
 

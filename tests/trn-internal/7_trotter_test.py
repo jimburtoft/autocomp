@@ -5,7 +5,6 @@ import nki
 import nki.language as nl
 import nki.isa as nisa
 import torch
-from torch_xla.core import xla_model as xm
 
 
 # ==============================================================================
@@ -711,7 +710,7 @@ def ref(
 
 def test_nki(ref_func, test_func):
     """Correctness check: 3x3 lattice, 10 Trotter steps, compare to CPU reference."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     L, n_steps = 3, 10
 
     for seed in range(2):
@@ -804,7 +803,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Latency benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     inputs = prepare_trotter_inputs(L=3, J=1.0, h=1.0, dt=0.01, n_steps=10)
 
     psi_r = torch.tensor(inputs["psi_real"], dtype=torch.float32, device=device)

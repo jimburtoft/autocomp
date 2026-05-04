@@ -5,7 +5,6 @@ import nki
 import nki.language as nl
 import nki.isa as nisa
 import torch
-from torch_xla.core import xla_model as xm
 
 
 # SUBSTITUTE HERE
@@ -551,7 +550,7 @@ def ref(
 
 def test_nki(ref_func, test_func):
     """Correctness check: compare ref and test on device tensors."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     N = 128
     H = 4
     d = 32
@@ -587,7 +586,7 @@ def test_nki(ref_func, test_func):
 
 def benchmark_nki(nki_func):
     """Latency benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
-    device = xm.xla_device()
+    device = torch.device("neuron")
     N = 128
     H = 4
     d = 32

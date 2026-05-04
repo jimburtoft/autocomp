@@ -4,7 +4,10 @@ from autocomp.common import logger
 from autocomp.search.prob import Prob
 
 workload_to_kernel_dict = {
-    "attention": ["gemm", "softmax"], # for now, attention is a combination of gemm and softmax
+    "attention": [
+        "gemm",
+        "softmax",
+    ],  # for now, attention is a combination of gemm and softmax
     "attention_decoder": ["gemm", "softmax", "causal_mask"],
     "llama_mlp": ["gemm", "softmax"],
     "llama_attention": ["gemm", "softmax"],
@@ -52,7 +55,7 @@ prob_to_name = {
 nki_isa_dict = {
     "architecture": {
         "description": """Kernel structure: Each NKI kernel has 3 stages — load data from HBM → SBUF, compute on NeuronCore, store results from SBUF → HBM.
-NKI Beta 2: Use namespace nki.* and nki.isa (not neuronxcc.nki.*). Mark top-level kernels with @nki.jit; remove @nki.jit from sub-kernels called from other kernels. All nki.isa APIs require explicit dst as first argument; nl.load/nl.store replaced by nisa.dma_copy; nl.arange and mask deprecated. See NKI Migration Guide (Beta 1 to Beta 2).
+NKI 0.3.0 (GA): Use namespace nki.* and nki.isa (not neuronxcc.nki.*). Mark top-level kernels with @nki.jit; remove @nki.jit from sub-kernels called from other kernels. All nki.isa APIs require explicit dst as first argument; nl.load/nl.store replaced by nisa.dma_copy; nl.arange and mask deprecated. See NKI Migration Guide (Beta 1 to Beta 2 / GA).
 
 NeuronCore: 2 per Trainium. Each has SBUF + PSUM SRAMs and 4 engines (Tensor, Vector, Scalar, GpSimd).
 
@@ -80,7 +83,7 @@ Tile-size constraints:
 Indexing:
     Standard Python-style indexing/slicing returns views.
     Indexing fewer dims (e.g. x[1]) can produce a valid Tile.
-    For contiguous access use regular integer slicing (e.g. t[0:128, 0:512]); nl.arange for indexing is removed in NKI Beta 2.
+    For contiguous access use regular integer slicing (e.g. t[0:128, 0:512]); nl.arange for indexing is removed in NKI Beta 2+.
     List indices must be integers or slices. They cannot be computed from affine_range loop variables.
     Slice with variable size is not supported.
     Tile on SBUF/PSUM must have at least 2 dimensions as described here. If using a 1D tile on SBUF/PSUM, users may get an “Insufficient rank” error. Workaround this by creating a 2D tile, e.g.,
@@ -101,7 +104,7 @@ Indexing:
         c = nl.exp(a[:, :])  # ok
         c = nl.exp(a[0:4, 0:4])  # also ok (slicing)
 
-NKI Beta 2: Masking deprecated. The mask parameter is no longer supported. Use Python min() and slice() to build in-bounds indexing (e.g. p_end = min(sz_p, p_start + 128); use t[p_start:p_end, f_start:f_end]).
+NKI Beta 2+: Masking deprecated. The mask parameter is no longer supported. Use Python min() and slice() to build in-bounds indexing (e.g. p_end = min(sz_p, p_start + 128); use t[p_start:p_end, f_start:f_end]).
 
     Matmul: use slicing for tile bounds (e.g. lhs[0:min(M,64), :], rhs[:, 0:min(N,256)]).
 
@@ -147,11 +150,12 @@ Other constraints:
 """,
     },
     "ElementWiseMath": [
-        {"header": "nl.add(x: tile | scalar, y: tile | scalar, dtype=None)", 
-         "description": """Element-wise addition. 
+        {
+            "header": "nl.add(x: tile | scalar, y: tile | scalar, dtype=None)",
+            "description": """Element-wise addition. 
 x.shape and y.shape must be broadcastable to a common shape, that will become the shape of the output. 
 dtype – (optional) data type to cast the output type to (see Supported Data Types for more information); if not specified, it will default to be the same as the data type of the input tiles, or whichever input type has the highest precision.""",
-         "examples": """# Beta 2: use nisa.dma_copy for HBM <-> SBUF (nl.load/nl.store removed)
+            "examples": """# Beta 2: use nisa.dma_copy for HBM <-> SBUF (nl.load/nl.store removed)
 a = nl.ndarray((128, 512), dtype=a_tensor.dtype, buffer=nl.sbuf)
 b = nl.ndarray((128, 512), dtype=b_tensor.dtype, buffer=nl.sbuf)
 nisa.dma_copy(dst=a, src=a_tensor[0:128, 0:512])
@@ -186,60 +190,190 @@ nisa.dma_copy(dst=c_tensor[0:128, 0:512], src=c)
 nisa.dma_copy(dst=a, src=a_tensor[0:128, 0:1])
 nisa.dma_copy(dst=b, src=b_tensor[0:1, 0:512])
 c = nl.add(a, b)
-nisa.dma_copy(dst=c_tensor[0:128, 0:512], src=c)"""},
-        {"header": "nl.subtract(x: tile | scalar, y: tile | scalar, dtype=None)", "description": "Element-wise subtraction."},
-        {"header": "nl.multiply(x: tile | scalar, y: tile | scalar, dtype=None)", "description": "Element-wise multiplication."},
-        {"header": "nl.divide(x: tile | scalar, y: tile | scalar, dtype=None)", "description": "Element-wise division."},
-        {"header": "nl.power(x: tile | scalar, y: tile | scalar, dtype=None)", "description": "Elements of x raised to powers of y, element-wise."},
-        {"header": "nl.maximum(x: tile | scalar, y: tile | scalar, dtype=None)", "description": "Maximum of the inputs, element-wise."},
-        {"header": "nl.minimum(x: tile | scalar, y: tile | scalar, dtype=None)", "description": "Minimum of the inputs, element-wise."},
-        {"header": "nl.abs(x: tile, dtype=None)", "description": "Element-wise absolute value."},
-        {"header": "nl.exp(x: tile, dtype=None)", "description": "Element-wise exponential (e**x)."},
-        {"header": "nl.log(x: tile, dtype=None)", "description": "Element-wise natural logarithm."},
-        {"header": "nl.sqrt(x: tile, dtype=None)", "description": "Element-wise non-negative square root."},
-        {"header": "nl.rsqrt(x: tile, dtype=None)", "description": "Element-wise reciprocal of the square root (1/sqrt(x))."},
-        {"header": "nl.square(x: tile, dtype=None)", "description": "Element-wise square (x*x)."},
-        {"header": "nl.reciprocal(x: tile, dtype=None)", "description": "Element-wise reciprocal (1/x)."},
+nisa.dma_copy(dst=c_tensor[0:128, 0:512], src=c)""",
+        },
+        {
+            "header": "nl.subtract(x: tile | scalar, y: tile | scalar, dtype=None)",
+            "description": "Element-wise subtraction.",
+        },
+        {
+            "header": "nl.multiply(x: tile | scalar, y: tile | scalar, dtype=None)",
+            "description": "Element-wise multiplication.",
+        },
+        {
+            "header": "nl.divide(x: tile | scalar, y: tile | scalar, dtype=None)",
+            "description": "Element-wise division.",
+        },
+        {
+            "header": "nl.power(x: tile | scalar, y: tile | scalar, dtype=None)",
+            "description": "Elements of x raised to powers of y, element-wise.",
+        },
+        {
+            "header": "nl.maximum(x: tile | scalar, y: tile | scalar, dtype=None)",
+            "description": "Maximum of the inputs, element-wise.",
+        },
+        {
+            "header": "nl.minimum(x: tile | scalar, y: tile | scalar, dtype=None)",
+            "description": "Minimum of the inputs, element-wise.",
+        },
+        {
+            "header": "nl.abs(x: tile, dtype=None)",
+            "description": "Element-wise absolute value.",
+        },
+        {
+            "header": "nl.exp(x: tile, dtype=None)",
+            "description": "Element-wise exponential (e**x).",
+        },
+        {
+            "header": "nl.log(x: tile, dtype=None)",
+            "description": "Element-wise natural logarithm.",
+        },
+        {
+            "header": "nl.sqrt(x: tile, dtype=None)",
+            "description": "Element-wise non-negative square root.",
+        },
+        {
+            "header": "nl.rsqrt(x: tile, dtype=None)",
+            "description": "Element-wise reciprocal of the square root (1/sqrt(x)).",
+        },
+        {
+            "header": "nl.square(x: tile, dtype=None)",
+            "description": "Element-wise square (x*x).",
+        },
+        {
+            "header": "nl.reciprocal(x: tile, dtype=None)",
+            "description": "Element-wise reciprocal (1/x).",
+        },
         {"header": "nl.sin(x: tile, dtype=None)", "description": "Element-wise sine."},
-        {"header": "nl.cos(x: tile, dtype=None)", "description": "Element-wise cosine."},
-        {"header": "nl.tanh(x: tile, dtype=None)", "description": "Element-wise hyperbolic tangent."},
-        {"header": "nl.ceil(x: tile, dtype=None)", "description": "Element-wise ceiling."},
-        {"header": "nl.floor(x: tile, dtype=None)", "description": "Element-wise floor."},
-        {"header": "nl.sign(x: tile, dtype=None)", "description": "Element-wise sign of a number."},
-        {"header": "nl.negative(x: tile, dtype=None)", "description": "Element-wise negative."},
-        {"header": "nl.trunc(x: tile, dtype=None)", "description": "Element-wise truncation."},
+        {
+            "header": "nl.cos(x: tile, dtype=None)",
+            "description": "Element-wise cosine.",
+        },
+        {
+            "header": "nl.tanh(x: tile, dtype=None)",
+            "description": "Element-wise hyperbolic tangent.",
+        },
+        {
+            "header": "nl.ceil(x: tile, dtype=None)",
+            "description": "Element-wise ceiling.",
+        },
+        {
+            "header": "nl.floor(x: tile, dtype=None)",
+            "description": "Element-wise floor.",
+        },
+        {
+            "header": "nl.sign(x: tile, dtype=None)",
+            "description": "Element-wise sign of a number.",
+        },
+        {
+            "header": "nl.negative(x: tile, dtype=None)",
+            "description": "Element-wise negative.",
+        },
+        {
+            "header": "nl.trunc(x: tile, dtype=None)",
+            "description": "Element-wise truncation.",
+        },
     ],
     "ActivationFunctions": [
-        {"header": "nl.relu(x: tile, dtype=None)", "description": "Rectified Linear Unit."},
-        {"header": "nl.sigmoid(x: tile, dtype=None)", "description": "Sigmoid activation."},
-        {"header": "nl.softmax(x: tile, axis: int|tuple, dtype=None)", "description": "Softmax activation along a specified axis."},
-        {"header": "nl.gelu(x: tile, dtype=None)", "description": "Gaussian Error Linear Unit."},
-        {"header": "nl.silu(x: tile, dtype=None)", "description": "Sigmoid Linear Unit (Swish)."}
+        {
+            "header": "nl.relu(x: tile, dtype=None)",
+            "description": "Rectified Linear Unit.",
+        },
+        {
+            "header": "nl.sigmoid(x: tile, dtype=None)",
+            "description": "Sigmoid activation.",
+        },
+        {
+            "header": "nl.softmax(x: tile, axis: int|tuple, dtype=None)",
+            "description": "Softmax activation along a specified axis.",
+        },
+        {
+            "header": "nl.gelu(x: tile, dtype=None)",
+            "description": "Gaussian Error Linear Unit.",
+        },
+        {
+            "header": "nl.silu(x: tile, dtype=None)",
+            "description": "Sigmoid Linear Unit (Swish).",
+        },
     ],
     "ReductionOperations": [
-        {"header": "nl.sum(x: tile, axis: int|tuple, dtype=None, keepdims=False)", "description": "Sum of elements along a specified free axis. Beta 2: mask parameter removed; use in-bounds slicing."},
-        {"header": "nl.prod(x: tile, axis: int|tuple, dtype=None, keepdims=False)", "description": "Product of elements along the specified free axis (or free axes) of the input. Beta 2: mask removed."},
-        {"header": "nl.all(x: tile, axis: int|tuple, dtype=None, keepdims=False)", "description": "Product of elements along the specified free axis (or free axes) of the input. Beta 2: mask removed."},
-        {"header": "nl.max(x: tile, axis: int|tuple, dtype=None, keepdims=False)", "description": "Maximum of elements along the specific free axis (or free axes) of the input. Beta 2: mask removed."},
-        {"header": "nl.min(x: tile, axis: int|tuple, dtype=None, keepdims=False)", "description": "Minimum of elements along the specific free axis (or free axes) of the input. Beta 2: mask removed."},
-        {"header": "nl.mean(x: tile, axis: int|tuple, dtype=None, keepdims=False)", "description": "Mean of elements along the specific free axis (or free axes) of the input. Beta 2: mask removed."},
+        {
+            "header": "nl.sum(x: tile, axis: int|tuple, dtype=None, keepdims=False)",
+            "description": "Sum of elements along a specified free axis. Beta 2: mask parameter removed; use in-bounds slicing.",
+        },
+        {
+            "header": "nl.prod(x: tile, axis: int|tuple, dtype=None, keepdims=False)",
+            "description": "Product of elements along the specified free axis (or free axes) of the input. Beta 2: mask removed.",
+        },
+        {
+            "header": "nl.all(x: tile, axis: int|tuple, dtype=None, keepdims=False)",
+            "description": "Product of elements along the specified free axis (or free axes) of the input. Beta 2: mask removed.",
+        },
+        {
+            "header": "nl.max(x: tile, axis: int|tuple, dtype=None, keepdims=False)",
+            "description": "Maximum of elements along the specific free axis (or free axes) of the input. Beta 2: mask removed.",
+        },
+        {
+            "header": "nl.min(x: tile, axis: int|tuple, dtype=None, keepdims=False)",
+            "description": "Minimum of elements along the specific free axis (or free axes) of the input. Beta 2: mask removed.",
+        },
+        {
+            "header": "nl.mean(x: tile, axis: int|tuple, dtype=None, keepdims=False)",
+            "description": "Mean of elements along the specific free axis (or free axes) of the input. Beta 2: mask removed.",
+        },
         # {"header": "nl.all_reduce(x: tile, op: binary_op, program_axes: int|tuple)", "description": "Performs a reduction (e.g., sum, max) across multiple SPMD programs."}
     ],
     "LogicalBitwise": [
-        {"header": "nl.equal(x: tile|scalar, y: tile|scalar)", "description": "Element-wise comparison (x == y)."},
-        {"header": "nl.not_equal(x: tile|scalar, y: tile|scalar)", "description": "Element-wise comparison (x != y)."},
-        {"header": "nl.greater(x: tile|scalar, y: tile|scalar)", "description": "Element-wise comparison (x > y)."},
-        {"header": "nl.less(x: tile|scalar, y: tile|scalar)", "description": "Element-wise comparison (x < y)."},
-        {"header": "nl.bitwise_and(x: tile|scalar, y: tile|scalar)", "description": "Element-wise bitwise AND."},
-        {"header": "nl.bitwise_or(x: tile|scalar, y: tile|scalar)", "description": "Element-wise bitwise OR."},
-        {"header": "nl.invert(x: tile)", "description": "Element-wise bitwise NOT (~x)."}
+        {
+            "header": "nl.equal(x: tile|scalar, y: tile|scalar)",
+            "description": "Element-wise comparison (x == y).",
+        },
+        {
+            "header": "nl.not_equal(x: tile|scalar, y: tile|scalar)",
+            "description": "Element-wise comparison (x != y).",
+        },
+        {
+            "header": "nl.greater(x: tile|scalar, y: tile|scalar)",
+            "description": "Element-wise comparison (x > y).",
+        },
+        {
+            "header": "nl.less(x: tile|scalar, y: tile|scalar)",
+            "description": "Element-wise comparison (x < y).",
+        },
+        {
+            "header": "nl.bitwise_and(x: tile|scalar, y: tile|scalar)",
+            "description": "Element-wise bitwise AND.",
+        },
+        {
+            "header": "nl.bitwise_or(x: tile|scalar, y: tile|scalar)",
+            "description": "Element-wise bitwise OR.",
+        },
+        {
+            "header": "nl.invert(x: tile)",
+            "description": "Element-wise bitwise NOT (~x).",
+        },
     ],
     "ShapeAndSelection": [
-        {"header": "nl.where(condition: tile[bool], x: tile, y: tile|scalar, dtype=None)", "description": "Return a tile with elements from x where condition is True, and elements from y otherwise. Note x must be a tile."},
-        {"header": "nl.broadcast_to(src: tile, *, shape: tuple=None)", "description": "Broadcasts a tile to a new shape. Returns a new tile broadcast along the partition dimension of src, this new tile will be in SBUF, but can be also assigned to a PSUM tensor."},
-        {"header": "nki.meta.tensor.broadcast_to(shape: tuple)", "description": "The tensor object must be a tile or can be implicitly converted to a tile. A tensor can be implicitly converted to a tile iff the partition dimension is the highest dimension. Returns a new view of the tile, no copy will occur. (Beta 2: nki.tensor moved to nki.meta.tensor)"},
-        {"header": "nl.expand_dims(data: tile, axis: int|tuple)", "description": "Inserts a new dimension of size 1 into the tile's shape."},
-        {"header": "nisa.nc_n_gather / nl.gather_flattened", "description": "Beta 2: nl.gather_flattened replaced by nisa.nc_n_gather (free partition limited to 512). Gathers elements from data's flattened free dimension using indices."}
+        {
+            "header": "nl.where(condition: tile[bool], x: tile, y: tile|scalar, dtype=None)",
+            "description": "Return a tile with elements from x where condition is True, and elements from y otherwise. Note x must be a tile.",
+        },
+        {
+            "header": "nl.broadcast_to(src: tile, *, shape: tuple=None)",
+            "description": "Broadcasts a tile to a new shape. Returns a new tile broadcast along the partition dimension of src, this new tile will be in SBUF, but can be also assigned to a PSUM tensor.",
+        },
+        {
+            "header": "nki.meta.tensor.broadcast_to(shape: tuple)",
+            "description": "The tensor object must be a tile or can be implicitly converted to a tile. A tensor can be implicitly converted to a tile iff the partition dimension is the highest dimension. Returns a new view of the tile, no copy will occur. (Beta 2: nki.tensor moved to nki.meta.tensor)",
+        },
+        {
+            "header": "nl.expand_dims(data: tile, axis: int|tuple)",
+            "description": "Inserts a new dimension of size 1 into the tile's shape.",
+        },
+        {
+            "header": "nisa.nc_n_gather / nl.gather_flattened",
+            "description": "Beta 2: nl.gather_flattened replaced by nisa.nc_n_gather (free partition limited to 512). Gathers elements from data's flattened free dimension using indices.",
+        },
     ],
     "nki.language.affine_range": {
         "header": "nl.affine_range(num_iterations: int):",
@@ -309,7 +443,7 @@ for i_input in nl.sequential_range(input0.shape[1] // 512):
     },
     "nki.compiler.sbuf.mod_alloc": {
         "header": "nki.compiler.sbuf.mod_alloc(*, base_addr, base_partition=0, num_par_tiles=(), num_free_tiles=())",
-        "description": """Deprecated in NKI Beta 2. Use the improved allocation API (e.g. nl.ndarray with address=) and avoid block dimensions; see NKI Migration Guide.
+        "description": """Deprecated in NKI Beta 2+. Use the improved allocation API (e.g. nl.ndarray with address=) and avoid block dimensions; see NKI Migration Guide.
 
 Allocate SBUF memory space for each logical tile in a tensor through modulo allocation. This is one of the NKI direct allocation APIs (Beta 1). When direct allocation is used, all tensors, including those written by ISA instructions (Beta 2: use explicit dst), in that kernel must also use direct allocation.
 When direct allocation is used, HBM tensors cannot be declared unless they are used as kernel outputs.
@@ -362,7 +496,7 @@ class SBufAllocator:
     },
     "nki.compiler.psum.mod_alloc": {
         "header": "nki.compiler.psum.mod_alloc(*, base_bank, base_addr=0, base_partition=0, num_bank_tiles=(), num_par_tiles=(), num_free_tiles=())",
-        "description": """Deprecated in NKI Beta 2. Use improved allocation API; see NKI Migration Guide.
+        "description": """Deprecated in NKI Beta 2+. Use improved allocation API; see NKI Migration Guide.
 
 Allocate PSUM memory space for each logical block in a tensor through modulo allocation. This is one of the NKI direct allocation APIs (Beta 1).
 
@@ -446,83 +580,74 @@ psum_min_align: The minimum byte alignment requirement for PSUM free dimension a
 sbuf_min_align: The minimum byte alignment requirement for SBUF free dimension address.
 total_available_sbuf_size: The total SBUF available size""",
     },
-    
-#    "nki.language.load": {
-#        "header": "nl.load(src: tile[HBM]) -> tile[SBUF] (same shape as src)",
-#        "description": "[Beta 1 only; removed in Beta 2] Use nisa.dma_copy(dst=sbuf_tile, src=hbm_tile) instead.",
-#        "examples": """# Partition dimension has to be the first dimension in the index tuple of a tile. Therefore, data may need to be split into multiple batches to load/store, for example:
-#for i_b in nl.affine_range(4):
-#  data_tile = nl.zeros((128, 512), dtype=in_tensor.dtype) 
-#  # load from in_tensor[4, 128, 512] one batch at a time
-#  # copy into data_tile[128, 512]
-#  i_p, i_f = nl.mgrid[0:128, 0:512]
-#  data_tile[i_p, i_f] = nl.load(in_tensor[i_b, i_p, i_f])
-#  ...
-
-# Also supports indirect DMA access with dynamic index values:
-#"""# Indirect DMA read example 1:
-# - data_tensor on HBM has shape [128 x 512].
-# - idx_tensor on HBM has shape [64] (with values [0, 2, 4, 6, ...]).
-# - idx_tensor values read from HBM and stored in SBUF idx_tile of shape [64 x 1]
-# - data_tensor values read from HBM indexed by values in idx_tile
-#   and store into SBUF data_tile of shape [64 x 512].
-#i_p = nl.arange(64)[:, None]
-#i_f = nl.arange(512)[None, :]
-#idx_tile = nl.load(idx_tensor[i_p]) # indices have to be in SBUF
-#data_tile = nl.load(data_tensor[idx_tile[i_p, 0], i_f])
-#...
-# Indirect DMA read example 2:
-# - data_tensor on HBM has shape [128 x 512].
-# - idx_tile on SBUF has shape [64 x 1] (with values [[0], [2], [4], ...] generated by iota)
-# - data_tensor values read from HBM indexed by values in idx_tile 
-#   and store into SBUF data_tile of shape [64 x 512].
-# i_f = nl.arange(512)[None, :]
-
-# idx_expr = 2*nl.arange(64)[:, None]
-# idx_tile = nisa.iota(idx_expr, dtype=np.int32)
-# data_tile = nl.load(data_tensor[idx_tile, i_f]) 
-# ...""",
-#    },
-    
-#     "nki.language.store": {
-#        "header": "nl.store(dst: tile[HBM], value: tile[SBUF])",
-#        "description": """[Beta 1 only; removed in Beta 2] Use nisa.dma_copy(dst=hbm_tile, src=sbuf_tile) instead. Store into a tensor on device memory (HBM) from on-chip memory (SBUF).
-#Parameters:
-#    dst – HBM tensor to store the data into.
-#    value – An SBUF tile that contains the values to store. If the tile is in PSUM, an extra copy will be performed to move the tile to SBUF first.""",
-#        "examples": """# Partition dimension has to be the first dimension in the index tuple of a tile. Therefore, data may need to be split into multiple batches to load/store, for example:
-# for i_b in nl.affine_range(4):
-#  data_tile = nl.zeros((128, 512), dtype=in_tensor.dtype) 
-
-#...
-#    store into out_tensor[4, 128, 512] one batch at a time
-# from data_tile[128, 512] 
-#i_p, i_f = nl.mgrid[0:128, 0:512]
-#nl.store(out_tensor[i_b, i_p, i_f], value=data_tile[i_p, i_f]) 
-
-# Also supports indirect DMA access with dynamic index values:
-# Indirect DMA write example 1:
-#  - data_tensor has shape [128 x 512].
-#  - idx_tensor on HBM has shape [64] (with values [0, 2, 4, 6, ...]).
-#  - idx_tensor values read from HBM and stored in SBUF idx_tile.
-#  - data_tile of shape [64 x 512] values written into
-#    HBM data_tensor indexed by values in idx_tile.
-# i_p = nl.arange(64)[:, None]
-# i_f = nl.arange(512)[None, :]
-# idx_tile = nl.load(idx_tensor[i_p]) # indices have to be in SB
-
-# nl.store(data_tensor[idx_tile[i_p, 0], i_f], value=data_tile[0:64, 0:512])
-
-# Indirect DMA write example 2:
-#  - data_tensor has shape [128 x 512].
-#  - idx_tile on SBUF has shape [64 x 1] (with values [[0], [2], [4], ...] generated by iota)
-#  - data_tile of shape [64 x 512] values written into
-#    HBM data_tensor indexed by values in idx_tile.
-# idx_expr = 2*nl.arange(64)[:, None]
-# idx_tile = nisa.iota(idx_expr, dtype=np.int32)
-
-# nl.store(data_tensor[idx_tile, i_f], value=data_tile[0:64, 0:512])""",
-#     },
+    #    "nki.language.load": {
+    #        "header": "nl.load(src: tile[HBM]) -> tile[SBUF] (same shape as src)",
+    #        "description": "[Beta 1 only; removed in Beta 2] Use nisa.dma_copy(dst=sbuf_tile, src=hbm_tile) instead.",
+    #        "examples": """# Partition dimension has to be the first dimension in the index tuple of a tile. Therefore, data may need to be split into multiple batches to load/store, for example:
+    # for i_b in nl.affine_range(4):
+    #  data_tile = nl.zeros((128, 512), dtype=in_tensor.dtype)
+    #  # load from in_tensor[4, 128, 512] one batch at a time
+    #  # copy into data_tile[128, 512]
+    #  i_p, i_f = nl.mgrid[0:128, 0:512]
+    #  data_tile[i_p, i_f] = nl.load(in_tensor[i_b, i_p, i_f])
+    #  ...
+    # Also supports indirect DMA access with dynamic index values:
+    # """# Indirect DMA read example 1:
+    # - data_tensor on HBM has shape [128 x 512].
+    # - idx_tensor on HBM has shape [64] (with values [0, 2, 4, 6, ...]).
+    # - idx_tensor values read from HBM and stored in SBUF idx_tile of shape [64 x 1]
+    # - data_tensor values read from HBM indexed by values in idx_tile
+    #   and store into SBUF data_tile of shape [64 x 512].
+    # i_p = nl.arange(64)[:, None]
+    # i_f = nl.arange(512)[None, :]
+    # idx_tile = nl.load(idx_tensor[i_p]) # indices have to be in SBUF
+    # data_tile = nl.load(data_tensor[idx_tile[i_p, 0], i_f])
+    # ...
+    # Indirect DMA read example 2:
+    # - data_tensor on HBM has shape [128 x 512].
+    # - idx_tile on SBUF has shape [64 x 1] (with values [[0], [2], [4], ...] generated by iota)
+    # - data_tensor values read from HBM indexed by values in idx_tile
+    #   and store into SBUF data_tile of shape [64 x 512].
+    # i_f = nl.arange(512)[None, :]
+    # idx_expr = 2*nl.arange(64)[:, None]
+    # idx_tile = nisa.iota(idx_expr, dtype=np.int32)
+    # data_tile = nl.load(data_tensor[idx_tile, i_f])
+    # ...""",
+    #    },
+    #     "nki.language.store": {
+    #        "header": "nl.store(dst: tile[HBM], value: tile[SBUF])",
+    #        "description": """[Beta 1 only; removed in Beta 2] Use nisa.dma_copy(dst=hbm_tile, src=sbuf_tile) instead. Store into a tensor on device memory (HBM) from on-chip memory (SBUF).
+    # Parameters:
+    #    dst – HBM tensor to store the data into.
+    #    value – An SBUF tile that contains the values to store. If the tile is in PSUM, an extra copy will be performed to move the tile to SBUF first.""",
+    #        "examples": """# Partition dimension has to be the first dimension in the index tuple of a tile. Therefore, data may need to be split into multiple batches to load/store, for example:
+    # for i_b in nl.affine_range(4):
+    #  data_tile = nl.zeros((128, 512), dtype=in_tensor.dtype)
+    # ...
+    #    store into out_tensor[4, 128, 512] one batch at a time
+    # from data_tile[128, 512]
+    # i_p, i_f = nl.mgrid[0:128, 0:512]
+    # nl.store(out_tensor[i_b, i_p, i_f], value=data_tile[i_p, i_f])
+    # Also supports indirect DMA access with dynamic index values:
+    # Indirect DMA write example 1:
+    #  - data_tensor has shape [128 x 512].
+    #  - idx_tensor on HBM has shape [64] (with values [0, 2, 4, 6, ...]).
+    #  - idx_tensor values read from HBM and stored in SBUF idx_tile.
+    #  - data_tile of shape [64 x 512] values written into
+    #    HBM data_tensor indexed by values in idx_tile.
+    # i_p = nl.arange(64)[:, None]
+    # i_f = nl.arange(512)[None, :]
+    # idx_tile = nl.load(idx_tensor[i_p]) # indices have to be in SB
+    # nl.store(data_tensor[idx_tile[i_p, 0], i_f], value=data_tile[0:64, 0:512])
+    # Indirect DMA write example 2:
+    #  - data_tensor has shape [128 x 512].
+    #  - idx_tile on SBUF has shape [64 x 1] (with values [[0], [2], [4], ...] generated by iota)
+    #  - data_tile of shape [64 x 512] values written into
+    #    HBM data_tensor indexed by values in idx_tile.
+    # idx_expr = 2*nl.arange(64)[:, None]
+    # idx_tile = nisa.iota(idx_expr, dtype=np.int32)
+    # nl.store(data_tensor[idx_tile, i_f], value=data_tile[0:64, 0:512])""",
+    #     },
     "nki.isa.activation": {
         "header": "nisa.activation(dst: tile[SBUF|PSUM], op: activation_function, data: tile[SBUF|PSUM], bias: tile[vector]=None, scale: scalar|tile[vector]=1.0, reduce_op: reduce_function=None, reduce_res: tile[vector]=None, reduce_cmd: nisa.reduce_cmd=nisa.reduce_cmd.idle, dtype: nki_dtype=data.dtype, name=None)",
         "description": """Apply an activation function on every element of the input tile using Scalar Engine, with an optional scale/bias operation before the activation and an optional reduction operation after the activation in the same instruction.
@@ -610,30 +735,29 @@ nisa.dma_copy(dst=c, src=c_tensor)
 activated_b = nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
 nisa.activation(dst=activated_b, op=np.square, data=b, bias=c, scale=2.0, dtype=nl.bfloat16)
 nisa.dma_copy(dst=b_act_tensor, src=activated_b)""",
-
-# # Example 3: Compute softmax with exp, bias subtraction, and reduction
-# # Applies exp(qk_sbuf - row_max) and accumulates results into sum_row_tiles
-# exp_row = nl.ndarray((nl.par_dim(PMAX), seqlen_kv),
-#                         dtype=nl.bfloat16, buffer=nl.sbuf)
-# qk_sbuf = nl.ndarray((nl.par_dim(PMAX), seqlen_kv // FMAX_MOVING, FMAX_MOVING),
-#                 dtype=nl.float32, buffer=nl.sbuf)
-# row_max = nl.ndarray((nl.par_dim(PMAX), 1), dtype=nl.float32,
-#                          buffer=nl.sbuf)
-# sum_row_tiles = nl.ndarray((nl.par_dim(PMAX), seqlen_kv // FMAX_MOVING), dtype=nl.float32,
-#                        buffer=nl.sbuf)
-# def exp_row_sum(i_tile_q):
-#     for i_tile_kv in nl.affine_range(seqlen_kv // FMAX_MOVING):
-#         nisa.activation(
-#             dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
-#             op=nl.exp,
-#             data=qk_sbuf[:, i_tile_kv, :],
-#             bias=row_max[:, :],
-#             reduce_op=nl.add,
-#             reduce_res=sum_row_tiles[:, i_tile_kv],
-#             reduce_cmd=nisa.reduce_cmd.reset_reduce,
-#             dtype=nl.bfloat16
-#             )
-# """,
+        # # Example 3: Compute softmax with exp, bias subtraction, and reduction
+        # # Applies exp(qk_sbuf - row_max) and accumulates results into sum_row_tiles
+        # exp_row = nl.ndarray((nl.par_dim(PMAX), seqlen_kv),
+        #                         dtype=nl.bfloat16, buffer=nl.sbuf)
+        # qk_sbuf = nl.ndarray((nl.par_dim(PMAX), seqlen_kv // FMAX_MOVING, FMAX_MOVING),
+        #                 dtype=nl.float32, buffer=nl.sbuf)
+        # row_max = nl.ndarray((nl.par_dim(PMAX), 1), dtype=nl.float32,
+        #                          buffer=nl.sbuf)
+        # sum_row_tiles = nl.ndarray((nl.par_dim(PMAX), seqlen_kv // FMAX_MOVING), dtype=nl.float32,
+        #                        buffer=nl.sbuf)
+        # def exp_row_sum(i_tile_q):
+        #     for i_tile_kv in nl.affine_range(seqlen_kv // FMAX_MOVING):
+        #         nisa.activation(
+        #             dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
+        #             op=nl.exp,
+        #             data=qk_sbuf[:, i_tile_kv, :],
+        #             bias=row_max[:, :],
+        #             reduce_op=nl.add,
+        #             reduce_res=sum_row_tiles[:, i_tile_kv],
+        #             reduce_cmd=nisa.reduce_cmd.reset_reduce,
+        #             dtype=nl.bfloat16
+        #             )
+        # """,
     },
     "nki.isa.reduce_cmd": {
         "header": "nisa.reduce_cmd",
@@ -641,7 +765,7 @@ nisa.dma_copy(dst=b_act_tensor, src=activated_b)""",
 .idle: Not using the accumulator registers
 .reset: Resets the accumulator registers to its initial state
 .reset_reduce: Resets the accumulator registers then immediately accumulate the results of the current instruction into the accumulators
-.reduce: keeps accumulating over the current value of the accumulator registers"""
+.reduce: keeps accumulating over the current value of the accumulator registers""",
     },
     "nki.isa.activation_reduce": {
         "header": "nisa.activation_reduce(dst: tile[SBUF|PSUM], op: activation_function, data: tile[SBUF|PSUM], reduce_op: reduce_function, reduce_res: tile[vector], bias: tile[vector]=None, scale: scalar|tile[vector]=1.0, dtype: nki_dtype=data.dtype, name=None)",
@@ -1493,7 +1617,7 @@ nisa.tensor_tensor_scan(dst=c[:, 0:512], data0=a[:, 0:512], data1=b[:, 0:512],
 
 nisa.tensor_tensor_scan(dst=c[:, 512:1024], data0=a[:, 512:1024], data1=b[:, 512:1024],
                         initial=c[:, 511], op0=np.multiply, op1=np.add)""",
-    }
+    },
 }
 
 kernel_insts_dict = {
@@ -1509,8 +1633,8 @@ kernel_insts_dict = {
         # "nki.compiler.sbuf.mod_alloc",
         # "nki.compiler.psum.mod_alloc",
         "nki.isa.dma_copy",
-        #"nki.language.load",
-        #"nki.language.store",
+        # "nki.language.load",
+        # "nki.language.store",
         "nki.isa.tensor_copy",
     ],
     "gemm": [
@@ -1549,11 +1673,11 @@ kernel_insts_dict = {
         "nki.isa.tensor_copy_predicated",
     ],
     "rmsnorm": [
-        "ElementWiseMath",              
-        "ReductionOperations",          
-        "ShapeAndSelection",            
-        "nki.isa.tensor_scalar",        
-        "nki.isa.tensor_reduce",        
+        "ElementWiseMath",
+        "ReductionOperations",
+        "ShapeAndSelection",
+        "nki.isa.tensor_scalar",
+        "nki.isa.tensor_reduce",
         "nki.isa.bn_stats",
         "nki.isa.bn_aggr",
     ],
@@ -1577,46 +1701,46 @@ kernel_insts_dict = {
         "nki.isa.local_gather",
     ],
     "conv2d": [
-        "ElementWiseMath",              
-        "ShapeAndSelection",            
-        "ReductionOperations",         
+        "ElementWiseMath",
+        "ShapeAndSelection",
+        "ReductionOperations",
         "nki.isa.dma_transpose",
-        "nki.isa.tensor_copy_predicated", 
-        "nki.isa.nc_transpose",         
-        "nki.isa.nc_matmul",           
-        "nki.isa.tensor_scalar",        
-        "nki.isa.tensor_tensor",        
-        "nki.isa.select_reduce",        
-        "nki.isa.local_gather",         
+        "nki.isa.tensor_copy_predicated",
+        "nki.isa.nc_transpose",
+        "nki.isa.nc_matmul",
+        "nki.isa.tensor_scalar",
+        "nki.isa.tensor_tensor",
+        "nki.isa.select_reduce",
+        "nki.isa.local_gather",
         "nki.isa.activation",
     ],
     "cumsum": [
-        "ElementWiseMath",                 
-        "ShapeAndSelection",               
-        "nki.isa.tensor_scalar",           
-        "nki.isa.tensor_tensor_scan",      
+        "ElementWiseMath",
+        "ShapeAndSelection",
+        "nki.isa.tensor_scalar",
+        "nki.isa.tensor_tensor_scan",
     ],
     "rope": [
         "ElementWiseMath",
         "ShapeAndSelection",
-        "nki.isa.tensor_copy_predicated",  
+        "nki.isa.tensor_copy_predicated",
         "nki.isa.tensor_scalar",
         "nki.isa.tensor_tensor",
     ],
-    "tensor_add": 
-    [
-        "ElementWiseMath",              
-        "ShapeAndSelection",            
-        "nki.isa.tensor_scalar",        
-        "nki.isa.tensor_tensor",        
+    "tensor_add": [
+        "ElementWiseMath",
+        "ShapeAndSelection",
+        "nki.isa.tensor_scalar",
+        "nki.isa.tensor_tensor",
     ],
     "transpose": [
         "ShapeAndSelection",
         "nki.isa.tensor_copy_predicated",
         # "nki.isa.dma_transpose",
         "nki.isa.nc_transpose",
-    ]
+    ],
 }
+
 
 class NkiIsaGenerator:
     def __init__(self):
@@ -1689,8 +1813,10 @@ class NkiIsaGenerator:
         else:
             raise ValueError(f"Invalid input type: {type(prob_or_name)}")
         logger.debug(f"Generating ISA for problem type: {name}")
-        kernels = self.workload_to_kernel_dict.get(name, [name]) # if not found, then <name> is a kernel
-        kernels = ["standard"] + kernels # always include standard instructions
+        kernels = self.workload_to_kernel_dict.get(
+            name, [name]
+        )  # if not found, then <name> is a kernel
+        kernels = ["standard"] + kernels  # always include standard instructions
         insts = []
         seen = set()
         for kernel in kernels:
