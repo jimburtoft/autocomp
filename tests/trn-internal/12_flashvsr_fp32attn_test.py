@@ -47,75 +47,95 @@ def test(q, k, v, scale: float = 1.0):
         for q_tile_idx in nl.affine_range(n_q_tiles):
             q_offset = q_tile_idx * PMAX
 
+            # Load Q tile
             q_tile = nl.ndarray((PMAX, d_head), dtype=q.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=q_tile, src=q[b, nl.ds(q_offset, PMAX), :])
 
-            q_scaled = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_scalar(q_scaled, q_tile, op0=nl.multiply, operand0=scale)
+            # Apply scale (stays bf16)
+            q_scaled_bf16 = nl.ndarray(
+                (PMAX, d_head), dtype=nl.bfloat16, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=q_scaled_bf16, data=q_tile, op0=nl.multiply, operand0=scale
+            )
 
+            # Transpose Q: (seq, d) -> (d, seq) for nc_matmul stationary
+            q_T_psum = nl.ndarray((d_head, PMAX), dtype=nl.bfloat16, buffer=nl.psum)
+            nisa.nc_transpose(q_T_psum, q_scaled_bf16)
+            q_T = nl.ndarray((d_head, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=q_T, src=q_T_psum)
+
+            # Running statistics for online softmax
             running_max = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(running_max, LARGE_NEG)
+            nisa.memset(dst=running_max, value=LARGE_NEG)
 
             running_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(running_sum, 0.0)
+            nisa.memset(dst=running_sum, value=0.0)
 
+            # Output accumulator
             out_acc = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(out_acc, 0.0)
+            nisa.memset(dst=out_acc, value=0.0)
 
             for kv_chunk_idx in range(n_kv_chunks):
                 kv_offset = kv_chunk_idx * K_TILE
 
+                # --- QK matmul ---
                 k_tile = nl.ndarray((d_head, K_TILE), dtype=k.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(dst=k_tile, src=k[b, :, nl.ds(kv_offset, K_TILE)])
 
-                q_scaled_bf16 = nl.ndarray(
-                    (PMAX, d_head), dtype=nl.bfloat16, buffer=nl.sbuf
-                )
-                nisa.tensor_copy(dst=q_scaled_bf16, src=q_scaled)
-
                 qk_psum = nl.ndarray((PMAX, K_TILE), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(qk_psum, q_scaled_bf16, k_tile)
+                nisa.nc_matmul(qk_psum, q_T, k_tile, accumulate=False)
 
                 qk_sbuf = nl.ndarray((PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=qk_sbuf, src=qk_psum)
 
+                # --- Online softmax ---
                 chunk_max = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_reduce(chunk_max, nl.maximum, qk_sbuf, axis=1)
+                nisa.tensor_reduce(dst=chunk_max, op=nl.maximum, data=qk_sbuf, axis=1)
 
                 new_max = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_tensor(new_max, running_max, chunk_max, op=nl.maximum)
-
-                max_diff = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_tensor(max_diff, running_max, new_max, op=nl.subtract)
-                correction = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.activation(correction, nl.exp, max_diff)
-
-                nisa.tensor_scalar(
-                    out_acc, out_acc, op0=nl.multiply, operand0=correction
+                nisa.tensor_tensor(
+                    dst=new_max, data1=running_max, data2=chunk_max, op=nl.maximum
                 )
 
+                max_diff = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(
+                    dst=max_diff, data1=running_max, data2=new_max, op=nl.subtract
+                )
+                correction = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=correction, op=nl.exp, data=max_diff)
+
                 nisa.tensor_scalar(
-                    running_sum, running_sum, op0=nl.multiply, operand0=correction
+                    dst=out_acc, data=out_acc, op0=nl.multiply, operand0=correction
+                )
+                nisa.tensor_scalar(
+                    dst=running_sum,
+                    data=running_sum,
+                    op0=nl.multiply,
+                    operand0=correction,
                 )
 
                 qk_centered = nl.ndarray(
                     (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
                 )
                 nisa.tensor_scalar(
-                    qk_centered, qk_sbuf, op0=nl.subtract, operand0=new_max
+                    dst=qk_centered, data=qk_sbuf, op0=nl.subtract, operand0=new_max
                 )
 
                 exp_scores = nl.ndarray(
                     (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
                 )
-                nisa.activation(exp_scores, nl.exp, qk_centered)
+                nisa.activation(dst=exp_scores, op=nl.exp, data=qk_centered)
 
                 chunk_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_reduce(chunk_sum, nl.add, exp_scores, axis=1)
-                nisa.tensor_tensor(running_sum, running_sum, chunk_sum, op=nl.add)
+                nisa.tensor_reduce(dst=chunk_sum, op=nl.add, data=exp_scores, axis=1)
+                nisa.tensor_tensor(
+                    dst=running_sum, data1=running_sum, data2=chunk_sum, op=nl.add
+                )
 
                 nisa.tensor_copy(dst=running_max, src=new_max)
 
+                # --- P@V matmul ---
                 pv_psum = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.psum)
 
                 for v_tile_idx in nl.affine_range(n_v_tiles_per_chunk):
@@ -135,18 +155,35 @@ def test(q, k, v, scale: float = 1.0):
                         src=exp_scores[:, nl.ds(exp_chunk_offset, V_TILE)],
                     )
 
-                    nisa.nc_matmul(pv_psum, exp_chunk_bf16, v_tile_bf16)
+                    # Transpose exp chunk for nc_matmul
+                    exp_T_psum = nl.ndarray(
+                        (V_TILE, PMAX), dtype=nl.bfloat16, buffer=nl.psum
+                    )
+                    nisa.nc_transpose(exp_T_psum, exp_chunk_bf16)
+                    exp_T = nl.ndarray(
+                        (V_TILE, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf
+                    )
+                    nisa.tensor_copy(dst=exp_T, src=exp_T_psum)
+
+                    # P@V: dst[seq, d] = sum_kv exp_T[kv, seq] * v_tile[kv, d]
+                    nisa.nc_matmul(pv_psum, exp_T, v_tile_bf16)
 
                 pv_sbuf = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=pv_sbuf, src=pv_psum)
 
-                nisa.tensor_tensor(out_acc, out_acc, pv_sbuf, op=nl.add)
+                nisa.tensor_tensor(dst=out_acc, data1=out_acc, data2=pv_sbuf, op=nl.add)
 
+            # --- Normalize by sum ---
             inv_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(inv_sum, nl.reciprocal, running_sum)
+            nisa.activation(
+                dst=inv_sum, op=nl.reciprocal, data=running_sum, bias=None, scale=1.0
+            )
 
-            nisa.tensor_scalar(out_acc, out_acc, op0=nl.multiply, operand0=inv_sum)
+            nisa.tensor_scalar(
+                dst=out_acc, data=out_acc, op0=nl.multiply, operand0=inv_sum
+            )
 
+            # --- Cast and store ---
             out_tile = nl.ndarray((PMAX, d_head), dtype=q.dtype, buffer=nl.sbuf)
             nisa.tensor_copy(dst=out_tile, src=out_acc)
 
@@ -157,7 +194,7 @@ def test(q, k, v, scale: float = 1.0):
 
 @nki.jit
 def ref(q, k, v, scale: float = 1.0):
-    """Reference: identical to test (FP32 flash attention)."""
+    """Reference: identical to test (FP32 flash attention with Q transpose)."""
     batch, seqlen_q, d_head = q.shape
     _, _, seqlen_kv = k.shape
 
@@ -178,17 +215,26 @@ def ref(q, k, v, scale: float = 1.0):
             q_tile = nl.ndarray((PMAX, d_head), dtype=q.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=q_tile, src=q[b, nl.ds(q_offset, PMAX), :])
 
-            q_scaled = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_scalar(q_scaled, q_tile, op0=nl.multiply, operand0=scale)
+            q_scaled_bf16 = nl.ndarray(
+                (PMAX, d_head), dtype=nl.bfloat16, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=q_scaled_bf16, data=q_tile, op0=nl.multiply, operand0=scale
+            )
+
+            q_T_psum = nl.ndarray((d_head, PMAX), dtype=nl.bfloat16, buffer=nl.psum)
+            nisa.nc_transpose(q_T_psum, q_scaled_bf16)
+            q_T = nl.ndarray((d_head, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=q_T, src=q_T_psum)
 
             running_max = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(running_max, LARGE_NEG)
+            nisa.memset(dst=running_max, value=LARGE_NEG)
 
             running_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(running_sum, 0.0)
+            nisa.memset(dst=running_sum, value=0.0)
 
             out_acc = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(out_acc, 0.0)
+            nisa.memset(dst=out_acc, value=0.0)
 
             for kv_chunk_idx in range(n_kv_chunks):
                 kv_offset = kv_chunk_idx * K_TILE
@@ -196,51 +242,54 @@ def ref(q, k, v, scale: float = 1.0):
                 k_tile = nl.ndarray((d_head, K_TILE), dtype=k.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(dst=k_tile, src=k[b, :, nl.ds(kv_offset, K_TILE)])
 
-                q_scaled_bf16 = nl.ndarray(
-                    (PMAX, d_head), dtype=nl.bfloat16, buffer=nl.sbuf
-                )
-                nisa.tensor_copy(dst=q_scaled_bf16, src=q_scaled)
-
                 qk_psum = nl.ndarray((PMAX, K_TILE), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(qk_psum, q_scaled_bf16, k_tile)
+                nisa.nc_matmul(qk_psum, q_T, k_tile, accumulate=False)
 
                 qk_sbuf = nl.ndarray((PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=qk_sbuf, src=qk_psum)
 
                 chunk_max = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_reduce(chunk_max, nl.maximum, qk_sbuf, axis=1)
+                nisa.tensor_reduce(dst=chunk_max, op=nl.maximum, data=qk_sbuf, axis=1)
 
                 new_max = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_tensor(new_max, running_max, chunk_max, op=nl.maximum)
-
-                max_diff = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_tensor(max_diff, running_max, new_max, op=nl.subtract)
-                correction = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.activation(correction, nl.exp, max_diff)
-
-                nisa.tensor_scalar(
-                    out_acc, out_acc, op0=nl.multiply, operand0=correction
+                nisa.tensor_tensor(
+                    dst=new_max, data1=running_max, data2=chunk_max, op=nl.maximum
                 )
 
+                max_diff = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(
+                    dst=max_diff, data1=running_max, data2=new_max, op=nl.subtract
+                )
+                correction = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=correction, op=nl.exp, data=max_diff)
+
                 nisa.tensor_scalar(
-                    running_sum, running_sum, op0=nl.multiply, operand0=correction
+                    dst=out_acc, data=out_acc, op0=nl.multiply, operand0=correction
+                )
+                nisa.tensor_scalar(
+                    dst=running_sum,
+                    data=running_sum,
+                    op0=nl.multiply,
+                    operand0=correction,
                 )
 
                 qk_centered = nl.ndarray(
                     (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
                 )
                 nisa.tensor_scalar(
-                    qk_centered, qk_sbuf, op0=nl.subtract, operand0=new_max
+                    dst=qk_centered, data=qk_sbuf, op0=nl.subtract, operand0=new_max
                 )
 
                 exp_scores = nl.ndarray(
                     (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
                 )
-                nisa.activation(exp_scores, nl.exp, qk_centered)
+                nisa.activation(dst=exp_scores, op=nl.exp, data=qk_centered)
 
                 chunk_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_reduce(chunk_sum, nl.add, exp_scores, axis=1)
-                nisa.tensor_tensor(running_sum, running_sum, chunk_sum, op=nl.add)
+                nisa.tensor_reduce(dst=chunk_sum, op=nl.add, data=exp_scores, axis=1)
+                nisa.tensor_tensor(
+                    dst=running_sum, data1=running_sum, data2=chunk_sum, op=nl.add
+                )
 
                 nisa.tensor_copy(dst=running_max, src=new_max)
 
@@ -263,17 +312,30 @@ def ref(q, k, v, scale: float = 1.0):
                         src=exp_scores[:, nl.ds(exp_chunk_offset, V_TILE)],
                     )
 
-                    nisa.nc_matmul(pv_psum, exp_chunk_bf16, v_tile_bf16)
+                    exp_T_psum = nl.ndarray(
+                        (V_TILE, PMAX), dtype=nl.bfloat16, buffer=nl.psum
+                    )
+                    nisa.nc_transpose(exp_T_psum, exp_chunk_bf16)
+                    exp_T = nl.ndarray(
+                        (V_TILE, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf
+                    )
+                    nisa.tensor_copy(dst=exp_T, src=exp_T_psum)
+
+                    nisa.nc_matmul(pv_psum, exp_T, v_tile_bf16)
 
                 pv_sbuf = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=pv_sbuf, src=pv_psum)
 
-                nisa.tensor_tensor(out_acc, out_acc, pv_sbuf, op=nl.add)
+                nisa.tensor_tensor(dst=out_acc, data1=out_acc, data2=pv_sbuf, op=nl.add)
 
             inv_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(inv_sum, nl.reciprocal, running_sum)
+            nisa.activation(
+                dst=inv_sum, op=nl.reciprocal, data=running_sum, bias=None, scale=1.0
+            )
 
-            nisa.tensor_scalar(out_acc, out_acc, op0=nl.multiply, operand0=inv_sum)
+            nisa.tensor_scalar(
+                dst=out_acc, data=out_acc, op0=nl.multiply, operand0=inv_sum
+            )
 
             out_tile = nl.ndarray((PMAX, d_head), dtype=q.dtype, buffer=nl.sbuf)
             nisa.tensor_copy(dst=out_tile, src=out_acc)
