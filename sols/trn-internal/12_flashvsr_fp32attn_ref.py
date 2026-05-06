@@ -193,14 +193,23 @@ def fp32_exp_attention(q, k, v, scale: float = 1.0):
                 )
 
                 # exp(QK - max) -- KEY: stays in fp32!
+                # OPTIMIZATION: Fused exp + reduction using nisa.activation's
+                # pipelined reduce capability. Computes exp(x) and sum(exp(x))
+                # in a single ISA instruction, eliminating a separate tensor_reduce.
                 exp_scores = nl.ndarray(
                     (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
                 )
-                nisa.activation(dst=exp_scores, op=nl.exp, data=qk_centered)
-
-                # Update running sum: running_sum += sum(exp_scores)
                 chunk_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_reduce(dst=chunk_sum, op=nl.add, data=exp_scores, axis=1)
+                nisa.activation(
+                    dst=exp_scores,
+                    op=nl.exp,
+                    data=qk_centered,
+                    reduce_op=nl.add,
+                    reduce_res=chunk_sum,
+                    reduce_cmd=nisa.reduce_cmd.reset_reduce,
+                )
+
+                # Update running sum: running_sum += chunk_sum
                 nisa.tensor_tensor(
                     dst=running_sum, data1=running_sum, data2=chunk_sum, op=nl.add
                 )

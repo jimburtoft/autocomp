@@ -122,13 +122,20 @@ def test(q, k, v, scale: float = 1.0):
                     dst=qk_centered, data=qk_sbuf, op0=nl.subtract, operand0=new_max
                 )
 
+                # Fused exp + reduction: computes exp(x) and sum(exp(x)) in one ISA instruction
                 exp_scores = nl.ndarray(
                     (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
                 )
-                nisa.activation(dst=exp_scores, op=nl.exp, data=qk_centered)
-
                 chunk_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_reduce(dst=chunk_sum, op=nl.add, data=exp_scores, axis=1)
+                nisa.activation(
+                    dst=exp_scores,
+                    op=nl.exp,
+                    data=qk_centered,
+                    reduce_op=nl.add,
+                    reduce_res=chunk_sum,
+                    reduce_cmd=nisa.reduce_cmd.reset_reduce,
+                )
+
                 nisa.tensor_tensor(
                     dst=running_sum, data1=running_sum, data2=chunk_sum, op=nl.add
                 )
@@ -280,13 +287,20 @@ def ref(q, k, v, scale: float = 1.0):
                     dst=qk_centered, data=qk_sbuf, op0=nl.subtract, operand0=new_max
                 )
 
+                # Fused exp + reduction: computes exp(x) and sum(exp(x)) in one ISA instruction
                 exp_scores = nl.ndarray(
                     (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
                 )
-                nisa.activation(dst=exp_scores, op=nl.exp, data=qk_centered)
-
                 chunk_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_reduce(dst=chunk_sum, op=nl.add, data=exp_scores, axis=1)
+                nisa.activation(
+                    dst=exp_scores,
+                    op=nl.exp,
+                    data=qk_centered,
+                    reduce_op=nl.add,
+                    reduce_res=chunk_sum,
+                    reduce_cmd=nisa.reduce_cmd.reset_reduce,
+                )
+
                 nisa.tensor_tensor(
                     dst=running_sum, data1=running_sum, data2=chunk_sum, op=nl.add
                 )
