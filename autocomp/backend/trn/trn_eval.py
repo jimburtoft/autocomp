@@ -1,4 +1,5 @@
 import os
+import glob
 import pathlib
 import json
 import re
@@ -26,15 +27,100 @@ class TrnEvalBackend(EvalBackend):
     #  Helpers                                                            #
     # ------------------------------------------------------------------ #
 
-    def _extract_latency(self, stdout: str) -> float:
-        """Extract latency from stdout using pattern 'Latency: <latency> ms'"""
+    def _extract_neff_path(self, stdout: str) -> str:
+        """Extract NEFF path from stdout using pattern 'NEFF_PATH: <path>'"""
         for line in stdout.split("\n"):
-            if "Latency:" in line and "ms" in line:
-                parts = line.split("Latency:")[1].split("ms")[0].strip()
-                try:
-                    return float(parts)
-                except ValueError:
-                    continue
+            if "NEFF_PATH:" in line:
+                return line.split("NEFF_PATH:")[1].strip()
+        return None
+
+    def _profile_neff(self, neff_path: str, temp_dir: pathlib.Path, idx: int) -> float:
+        """Profile a compiled NEFF using neuron-profile to get device-only timing.
+
+        Returns latency in milliseconds, or None on failure.
+        Requires exclusive NeuronCore access (no other process holding cores).
+        """
+        if not neff_path or not os.path.exists(neff_path):
+            return None
+
+        ntff_base = str(temp_dir / f"profile_{idx}")
+        num_exec = 10
+
+        # Capture profile
+        try:
+            result = subprocess.run(
+                [
+                    "/opt/aws/neuron/bin/neuron-profile",
+                    "capture",
+                    "-n",
+                    neff_path,
+                    "-s",
+                    f"{ntff_base}.ntff",
+                    f"--num-exec={num_exec}",
+                    f"--profile-nth-exec={num_exec}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error(f"neuron-profile capture timed out for code {idx}")
+            return None
+
+        if result.returncode != 0:
+            logger.error(
+                f"neuron-profile capture failed for code {idx}: {result.stderr[:200]}"
+            )
+            return None
+
+        # Find the actual NTFF file (neuron-profile appends _exec_N)
+        ntff_files = sorted(glob.glob(f"{ntff_base}*.ntff"))
+        if not ntff_files:
+            logger.error(f"No NTFF file produced for code {idx}")
+            return None
+        ntff_path = ntff_files[-1]
+
+        # Extract total_time from summary-json
+        try:
+            view_result = subprocess.run(
+                [
+                    "/opt/aws/neuron/bin/neuron-profile",
+                    "view",
+                    "-n",
+                    neff_path,
+                    "-s",
+                    ntff_path,
+                    "--output-format",
+                    "summary-json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error(f"neuron-profile view timed out for code {idx}")
+            return None
+
+        if view_result.returncode != 0:
+            logger.error(
+                f"neuron-profile view failed for code {idx}: {view_result.stderr[:200]}"
+            )
+            return None
+
+        try:
+            data = json.loads(view_result.stdout)
+            summary = next(iter(data.values()), {})
+            total_time = summary.get("total_time")
+            if total_time is not None:
+                latency_ms = float(total_time) * 1000.0
+                logger.info(
+                    f"Code {idx} device-only latency: {latency_ms:.4f} ms "
+                    f"(from neuron-profile total_time)"
+                )
+                return latency_ms
+        except (json.JSONDecodeError, StopIteration, ValueError) as e:
+            logger.error(f"Failed to parse neuron-profile JSON for code {idx}: {e}")
+
         return None
 
     def _extract_ref_func_name(self, test_code: str) -> str:
@@ -352,46 +438,31 @@ print(json.dumps({{"compiled": os.path.exists(_neff_path), "error": _error_msg}}
     ) -> dict:
         """Evaluate a single implementation in its own subprocess.
 
-        Uses PyTorch Native (torch.device('neuron')) for device execution
-        and torch.neuron.synchronize() for timing synchronization.
+        The subprocess runs the kernel for correctness (test_nki) and
+        outputs the compiled NEFF path. After the subprocess exits and
+        releases NeuronCores, we run neuron-profile on the NEFF to get
+        true device-only latency from hardware counters.
 
-        On NKI 0.3.0 (GA), nki.benchmark may be available for true hardware
-        latency measurement. If not, falls back to wall-clock timing with
-        torch.neuron.synchronize() barriers.
+        Returns dict with keys: correct (bool), latency (float ms or None),
+        stdout, stderr.
         """
         test_code_i = test_code.replace("# SUBSTITUTE HERE", code_str)
 
-        # Replace the __main__ block with a PyTorch Native timing version
-        # that outputs "Latency: <ms> ms" to stdout.
-        #
-        # Key design for NKI 0.3.0 + PyTorch Native:
-        #
-        # PyTorch Native replaces the XLA-based torch-neuronx pipeline.
-        # Instead of xm.mark_step() + xm.wait_device_ops(), we use
-        # torch.neuron.synchronize() for device synchronization.
-        #
-        # NKI 0.3.0 (GA) should have nki.benchmark available for true
-        # hardware latency. We first try nki.benchmark; if it raises
-        # NotImplementedError, we fall back to wall-clock timing.
-        #
-        # The specialize_and_call caching monkey-patch is retained as a
-        # safety net — NKI 0.3.0 may still use random temp paths for KLR
-        # binaries. If the GA release fixes this, the patch is a harmless
-        # no-op. This needs to be verified on-instance.
+        # Replace the __main__ block with correctness check + NEFF extraction.
+        # Timing is handled externally by neuron-profile after this process exits.
         if "if __name__" in test_code_i:
             main_idx = test_code_i.index("if __name__")
             test_code_i = (
                 test_code_i[:main_idx]
                 + """\
 if __name__ == "__main__":
-    import time
+    import os
     import hashlib
     import torch
 
     # ---- Fix NKI compilation caching (safety net) ----
     # Monkey-patch specialize_and_call to use deterministic temp paths.
-    # NKI 0.3.0 may fix this natively; if so this patch is a harmless no-op.
-    # Without this on NKI 0.2.0, every @nki.jit call recompiles (~1.3s)
+    # Without this on older NKI, every @nki.jit call recompiles (~1.3s)
     # because random temp directories make each compilation cache key unique.
     try:
         import tempfile as _tempfile
@@ -417,10 +488,9 @@ if __name__ == "__main__":
 
         TraceKernel.specialize_and_call = _patched_specialize
     except (ImportError, AttributeError):
-        # NKI 0.3.0 may have restructured TraceKernel — skip if not found
         pass
 
-    # Phase 1: Correctness check via test_nki (first calls compile)
+    # Phase 1: Correctness check (also triggers compilation + NEFF caching)
     test_result = test_nki(ref, test)
     if not test_result:
         print("Test failed")
@@ -428,83 +498,18 @@ if __name__ == "__main__":
     else:
         print("Test passed")
 
-    # Phase 2: Benchmark using nki.benchmark (NKI 0.3.0 GA) or wall-clock fallback.
-    # First try the real nki.benchmark for true hardware latency.
-    # If unavailable, monkey-patch with PyTorch Native wall-clock timing
-    # using torch.neuron.synchronize() for accurate device synchronization.
-    _use_real_benchmark = False
-    try:
-        # Test if nki.benchmark actually works (not just importable)
-        @nki.benchmark(warmup=1, iters=1)
-        def _probe_benchmark(x_hbm):
-            pass
-        _use_real_benchmark = True
-        print("nki.benchmark: AVAILABLE (using true hardware latency)")
-    except (NotImplementedError, TypeError, Exception):
-        print("nki.benchmark: NOT AVAILABLE (using wall-clock fallback)")
-
-    if not _use_real_benchmark:
-        class _LatencyResult:
-            def __init__(self, times_us):
-                self._times = sorted(times_us)
-            def get_latency_percentile(self, pct):
-                idx = int(len(self._times) * pct / 100.0)
-                idx = min(idx, len(self._times) - 1)
-                return self._times[idx]
-
-        class _BenchmarkResult:
-            def __init__(self, times_us):
-                self.nc_latency = _LatencyResult(times_us)
-
-        class _BenchmarkWrapper:
-            def __init__(self, func, warmup, iters):
-                self._func = func
-                self._warmup = warmup
-                self._iters = iters
-                self.benchmark_result = None
-
-            def __call__(self, *args, **kwargs):
-                # Warmup: first call triggers compilation + cache save;
-                # subsequent warmup calls verify cache hits.
-                for _w in range(self._warmup + 3):
-                    _out = self._func(*args, **kwargs)
-                torch.neuron.synchronize()
-
-                # Timed iterations with PyTorch Native synchronization.
-                _num_iters = max(self._iters, 20)
-                times_us = []
-                for _i in range(_num_iters):
-                    torch.neuron.synchronize()
-                    _t0 = time.perf_counter()
-                    _out = self._func(*args, **kwargs)
-                    torch.neuron.synchronize()
-                    _t1 = time.perf_counter()
-                    times_us.append((_t1 - _t0) * 1e6)  # microseconds
-
-                self.benchmark_result = _BenchmarkResult(times_us)
-                median_us = sorted(times_us)[len(times_us)//2]
-                p99_us = sorted(times_us)[int(len(times_us)*0.99)]
-                print(f"Latency: {median_us/1000.0:.3f} ms (median)")
-                print(f"Latency: {p99_us/1000.0:.3f} ms (P99)")
-
-        def _mock_benchmark(warmup=2, iters=10):
-            def _decorator(func):
-                return _BenchmarkWrapper(func, warmup, iters)
-            return _decorator
-
-        # Monkey-patch nki.benchmark
-        nki.benchmark = _mock_benchmark
-
-    try:
-        if 'benchmark_nki' in dir():
-            benchmark_nki(test)
-        else:
-            raise RuntimeError("No benchmark_nki function available")
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"Latency: 1.000 ms (fallback)")
-        print(f"Benchmark error: {e}", flush=True)
+    # Find and output the NEFF path from compile cache.
+    # neuron-profile will use this for device-only timing after this process exits.
+    import glob as _glob
+    _cache_dir = "/var/tmp/neuron-compile-cache"
+    _neff_files = sorted(
+        _glob.glob(f"{_cache_dir}/**/*.neff", recursive=True),
+        key=os.path.getmtime, reverse=True
+    )
+    if _neff_files:
+        print(f"NEFF_PATH: {_neff_files[0]}")
+    else:
+        print("WARNING: No NEFF found in compile cache")
 """
             )
 
@@ -541,14 +546,33 @@ if __name__ == "__main__":
             logger.error(f"Code {idx} failed to run")
             return result_dict
 
-        latency = self._extract_latency(p.stdout)
-        if latency is None:
-            logger.error(f"Code {idx} did not produce latency output")
+        # Correctness is determined by "Test passed" in stdout
+        if "Test passed" not in p.stdout:
+            logger.error(f"Code {idx} did not pass correctness check")
             return result_dict
 
-        logger.info(f"Code {idx} latency: {latency}")
         result_dict["correct"] = True
-        result_dict["latency"] = latency
+
+        # Get device-only timing via neuron-profile (subprocess has exited,
+        # NeuronCores should be free).
+        neff_path = self._extract_neff_path(p.stdout)
+        device_latency = self._profile_neff(neff_path, temp_dir, idx)
+
+        if device_latency is not None:
+            logger.info(
+                f"Code {idx} device-only latency: {device_latency:.4f} ms "
+                f"(from neuron-profile)"
+            )
+            result_dict["latency"] = device_latency
+        else:
+            logger.warning(
+                f"Code {idx}: neuron-profile failed to produce device-only timing. "
+                f"NEFF path was: {neff_path}. "
+                f"Latency will be reported as None (no wall-clock fallback). "
+                f"Ensure /opt/aws/neuron/bin/neuron-profile is available and "
+                f"NeuronCores are not held by another process."
+            )
+
         return result_dict
 
     # ------------------------------------------------------------------ #
@@ -661,10 +685,9 @@ if __name__ == "__main__":
 
         results = None
         # Combined evaluation (Phase 1 + Phase 2) requires nki.baremetal.
-        # On SDK 2.29 / NKI 0.3.0, nki.baremetal may be available — needs
-        # on-instance verification. For now, skip to individual evaluation
-        # which uses nki.benchmark (if available) or wall-clock timing.
-        # TODO: Re-enable when nki.baremetal support is confirmed on NKI 0.3.0.
+        # On SDK 2.29+ / NKI 0.3.0+, nki.baremetal is not available.
+        # Individual evaluation uses neuron-profile for device-only timing.
+        # TODO: Re-enable combined evaluation if nki.baremetal returns in a future SDK.
         if False and self.parallel:
             results = self._try_combined_evaluation(test_code, code_strs, temp_dir)
         if results is not None:
