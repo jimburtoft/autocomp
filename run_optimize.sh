@@ -62,6 +62,7 @@ for PROB_ID in $KERNELS; do
         14) NAME="ltx2_crossattn" ;;
         15) NAME="gemm" ;;
         21) NAME="cross_entropy" ;;
+        22) NAME="hunyuan_dit_attn" ;;
         5) NAME="fft256" ;;
         6) NAME="mamba_scan" ;;
         4) NAME="trimul" ;;
