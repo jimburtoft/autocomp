@@ -25,7 +25,9 @@ class TrnNki2LLMAgent(LLMAgent):
     def _match_names_from_llm(self, prompt: str, valid_names: list[str]) -> list[str]:
         """Send a selection prompt to the LLM and fuzzy-match the response to valid names."""
         try:
-            responses = self.llm_client.chat(prompt=prompt, num_candidates=1, temperature=0)
+            responses = self.llm_client.chat(
+                prompt=prompt, num_candidates=1, temperature=0
+            )
             raw = responses[0] if responses else ""
             selected: list[str] = []
             for line in raw.strip().split("\n"):
@@ -82,7 +84,9 @@ class TrnNki2LLMAgent(LLMAgent):
             return self._isa_selection_cache[cache_key]
 
         selected_names = self._select_isa_instructions(prob, code)
-        logger.debug("LLM selected %d ISA instructions for %s", len(selected_names), cache_key)
+        logger.debug(
+            "LLM selected %d ISA instructions for %s", len(selected_names), cache_key
+        )
         isa_text = self.nki_isa_generator.generate_isa_from_names(selected_names)
         self._isa_selection_cache[cache_key] = isa_text
         return isa_text
@@ -158,45 +162,69 @@ class TrnNki2LLMAgent(LLMAgent):
         rules = []
         rules.extend(self.hw_config.get_hw_config_specific_rules())
         rules.extend(self.eval_backend.get_backend_specific_rules())
-        rules.extend([
-                 "The rewritten program should be semantically equivalent to the original program, within a small numerical tolerance.",
-                 "Keep the same function name and signature as the original program (helper functions can be renamed or deleted).",
-                 "Maintain correct tensor shapes and indexing patterns. Remember not to index with affine_range loop variables. Avoid loop carried dependencies.",
-                 "The following imports have already been run: import nki; import nki.isa as nisa; import nki.language as nl; import numpy as np;",
-                ])
+        rules.extend(
+            [
+                "The rewritten program should be semantically equivalent to the original program, within a small numerical tolerance.",
+                "Keep the same function name and signature as the original program (helper functions can be renamed or deleted).",
+                "Maintain correct tensor shapes and indexing patterns. Remember not to index with affine_range loop variables. Avoid loop carried dependencies.",
+                "The following imports have already been run: import neuronxcc.nki as nki; import neuronxcc.nki.isa as nisa; import neuronxcc.nki.language as nl; import numpy as np;",
+            ]
+        )
+        # NKI 0.3.0 compatibility rules (CRITICAL)
+        rules.extend(
+            [
+                "CRITICAL: Use ONLY the nl.* high-level API (nl.matmul, nl.exp, nl.max, nl.sum, nl.load, nl.store, nl.full, nl.zeros, nl.arange, nl.sequential_range, nl.affine_range, nl.ds). Do NOT use nisa.* ISA-level instructions (nisa.tensor_scalar, nisa.nc_matmul, nisa.activation, etc.) as they have broken scalar operations in this NKI version.",
+                "CRITICAL: nl.matmul does NOT accept a dtype= keyword argument. Use nl.matmul(x, y) only.",
+                "CRITICAL: For tensors used as accumulators across loop iterations (e.g., running_max, running_sum, out_acc), you MUST use in-place index update syntax: tensor[i_p, i_d] = new_value. Do NOT use reassignment (tensor = new_value) as this violates NKI 0.3.0 scope rules. Define index tensors i_p = nl.arange(P)[:, None] and i_d = nl.arange(D)[None, :] before the loop.",
+                "CRITICAL: The partition dimension (first dimension of any tile in SBUF) cannot exceed 128. If you need to process more than 128 elements along the partition dimension, you must sub-tile into chunks of 128.",
+                "Use nl.sequential_range (not Python range()) for loops with data dependencies between iterations (e.g., KV loop in flash attention).",
+            ]
+        )
         if planning:
             rules.append("Limit the scope of the plan to the selected optimization.")
             if random.random() < 0.4:
-                rules.append("Limit the scope of the plan so that the rewritten program is still correct.")
+                rules.append(
+                    "Limit the scope of the plan so that the rewritten program is still correct."
+                )
             elif random.random() < 0.3:
-                rules.append("Plans can be highly targeted to one particular part of the code.")
-            rules.append("Do not count out any of the <optimizations> unless they are clearly irrelevant to the code.")
+                rules.append(
+                    "Plans can be highly targeted to one particular part of the code."
+                )
+            rules.append(
+                "Do not count out any of the <optimizations> unless they are clearly irrelevant to the code."
+            )
         if coding:
             rules.append("Optimize the test() function and do not change its name.")
-            rules.append("Wrap the generated code with ```python at the beginning and ``` at the end.")
-        rules.append("Ensure that loop dependencies are not violated inside affine_range loops.")
+            rules.append(
+                "Wrap the generated code with ```python at the beginning and ``` at the end."
+            )
+        rules.append(
+            "Ensure that loop dependencies are not violated inside affine_range loops."
+        )
 
         prompt_text = ""
         for i, rule in enumerate(rules):
-            prompt_text += f"{i+1}. {rule}\n"
+            prompt_text += f"{i + 1}. {rule}\n"
         return prompt_text
 
-    def _get_propose_optimizations_prompt(self, candidate: CodeCandidate,
-                                          prob: Prob,
-                                          force_opt_menu: int, 
-                                          prompt_end: str, 
-                                          analysis: str, 
-                                          shuffle_opts: bool, 
-                                          give_score_feedback: float,
-                                          give_util_feedback: float,
-                                          give_hw_feedback: float,
-                                          include_ancestors: bool,
-                                          plan_icl_examples: bool,
-                                          cur_iter: int,
-                                          num_iters: int,
-                                          dropout_menu_options: float,
-                                          translate: bool,
-                                         ) -> str:
+    def _get_propose_optimizations_prompt(
+        self,
+        candidate: CodeCandidate,
+        prob: Prob,
+        force_opt_menu: int,
+        prompt_end: str,
+        analysis: str,
+        shuffle_opts: bool,
+        give_score_feedback: float,
+        give_util_feedback: float,
+        give_hw_feedback: float,
+        include_ancestors: bool,
+        plan_icl_examples: bool,
+        cur_iter: int,
+        num_iters: int,
+        dropout_menu_options: float,
+        translate: bool,
+    ) -> str:
         # Select which menu options will appear
         menu_options_text = ""
         if translate:
@@ -204,7 +232,9 @@ class TrnNki2LLMAgent(LLMAgent):
         else:
             opt_lst = self.get_opt_menu_options(prob)
             if dropout_menu_options < 1 and not force_opt_menu:
-                opt_lst = [opt for opt in opt_lst if random.random() < dropout_menu_options]
+                opt_lst = [
+                    opt for opt in opt_lst if random.random() < dropout_menu_options
+                ]
             if shuffle_opts:
                 random.shuffle(opt_lst)
         include_score_feedback = random.random() < give_score_feedback
@@ -214,14 +244,34 @@ class TrnNki2LLMAgent(LLMAgent):
         while cur_cand is not None:
             # Go up to each parent and append to front of prompt
             if include_score_feedback and (cur_cand.score is not None):
-                parents_prompt = f"The latency of this code was {cur_cand.score} ms.\n" + parents_prompt
+                parents_prompt = (
+                    f"The latency of this code was {cur_cand.score} ms.\n"
+                    + parents_prompt
+                )
             if not include_ancestors:
-                parents_prompt = "\nThe original unoptimized code was:\n```\n" + cur_cand.code + "\n```\n" + parents_prompt
-                break # No need to go up past the immediate parent
+                parents_prompt = (
+                    "\nThe original unoptimized code was:\n```\n"
+                    + cur_cand.code
+                    + "\n```\n"
+                    + parents_prompt
+                )
+                break  # No need to go up past the immediate parent
             elif cur_cand.plan is not None:
-                parents_prompt = "\nNext, we applied this plan to the code:\n" + cur_cand.plan + "\nThe generated code was:\n" + cur_cand.code + "\n" + parents_prompt
+                parents_prompt = (
+                    "\nNext, we applied this plan to the code:\n"
+                    + cur_cand.plan
+                    + "\nThe generated code was:\n"
+                    + cur_cand.code
+                    + "\n"
+                    + parents_prompt
+                )
             else:
-                parents_prompt = "\nThe original unoptimized code was:\n```\n" + cur_cand.code + "\n```\n" + parents_prompt
+                parents_prompt = (
+                    "\nThe original unoptimized code was:\n```\n"
+                    + cur_cand.code
+                    + "\n```\n"
+                    + parents_prompt
+                )
             cur_cand = cur_cand.parent
 
         if analysis:
@@ -230,19 +280,29 @@ class TrnNki2LLMAgent(LLMAgent):
         # Initialize the prompt with NKI context
         prompt_text = "The NKI (Neuron Kernel Interface) is used for writing high-performance kernels on AWS Trainium and Inferentia chips.\n"
         prompt_text += self._get_isa_for_problem(prob, candidate.code)
-        
+
         prompt_text += parents_prompt
 
         # Now add the actual planning prompt
         for i, opt in enumerate(opt_lst):
-            menu_options_text += f"{i+1}. {opt}\n"
-        
-        prompt_text += "Please carefully review the NKI code to identify any inefficiencies. "
-        prompt_text += "Performance can be improved by using the following optimizations:\n"
+            menu_options_text += f"{i + 1}. {opt}\n"
+
+        prompt_text += (
+            "Please carefully review the NKI code to identify any inefficiencies. "
+        )
+        prompt_text += (
+            "Performance can be improved by using the following optimizations:\n"
+        )
         prompt_text += "<optimizations>:\n" + menu_options_text + "\n"
-        
+
         if force_opt_menu:
-            prompt_text += "Explain how to apply <optimization> " + str(force_opt_menu) + ": '" + opt_lst[force_opt_menu-1] + "' to the above code to reduce execution time, and explain how it will improve performance."
+            prompt_text += (
+                "Explain how to apply <optimization> "
+                + str(force_opt_menu)
+                + ": '"
+                + opt_lst[force_opt_menu - 1]
+                + "' to the above code to reduce execution time, and explain how it will improve performance."
+            )
         else:
             prompt_text += "You are an expert NKI performance engineer generating high-performance Trainium/Inferentia kernels. "
 
@@ -258,7 +318,9 @@ class TrnNki2LLMAgent(LLMAgent):
             else:
                 prompt_text += "Come up with a plan to apply exactly one of the <optimizations> to address the inefficiencies of the above code and reduce its execution time."
 
-        prompt_text += " The plan should be specific to this code and explain how to change it."
+        prompt_text += (
+            " The plan should be specific to this code and explain how to change it."
+        )
         # # TODO make it a parameter
         # if random.random() < 0.5:
         #     prompt_text += " The plan should be specific to this code and explain how to change it."
@@ -270,7 +332,12 @@ class TrnNki2LLMAgent(LLMAgent):
             prompt_text += "\n" + prompt_end
         return prompt_text
 
-    def _get_implement_code_prompt(self, candidate: CodeCandidate, prob: Prob = None, code_icl_examples: bool = True) -> str:
+    def _get_implement_code_prompt(
+        self,
+        candidate: CodeCandidate,
+        prob: Prob = None,
+        code_icl_examples: bool = True,
+    ) -> str:
         prompt_text = "The NKI (Neuron Kernel Interface) is used for writing high-performance kernels on AWS Trainium and Inferentia chips.\n"
         if prob is None:
             raise ValueError("TrnNki2LLMAgent requires prob parameter to be provided")
@@ -297,19 +364,23 @@ class TrnNki2LLMAgent(LLMAgent):
 
         return prompt_text
 
-    def _get_combine_candidates_prompt(self, candidates: list[CodeCandidate], prob: Prob = None) -> str:
+    def _get_combine_candidates_prompt(
+        self, candidates: list[CodeCandidate], prob: Prob = None
+    ) -> str:
         prompt_text = "The NKI (Neuron Kernel Interface) is used for writing high-performance kernels on AWS Trainium and Inferentia chips.\n"
         prompt_text += "You are an expert NKI performance engineer generating high-performance Trainium/Inferentia kernels. "
         prompt_text += "Let's combine the following optimized NKI code samples to extract the high-performance characteristics of each:\n"
         for i, c in enumerate(candidates):
-            prompt_text += f"Sample {i+1}:\n{c.code}\n"
+            prompt_text += f"Sample {i + 1}:\n{c.code}\n"
 
         prompt_text += "\nMake sure to follow these rules:"
         prompt_text += self._get_prompt_rules(planning=False, coding=True, prob=prob)
         prompt_text += "\nOptimized combined NKI code:"
         return prompt_text
 
-    def _get_reimplement_failed_code_prompt(self, candidate: CodeCandidate, prob: Prob = None) -> str:
+    def _get_reimplement_failed_code_prompt(
+        self, candidate: CodeCandidate, prob: Prob = None
+    ) -> str:
         """
         Generate a prompt to reimplement failed code based on stdout/stderr feedback.
         """
@@ -327,7 +398,7 @@ class TrnNki2LLMAgent(LLMAgent):
         # prompt_text += "\n\nThe generated code was:\n"
         prompt_text += "\nThe code was:\n"
         prompt_text += candidate.code
-        
+
         # Add error information
         prompt_text += "\n\nHowever, the code failed with the following output:\n"
         if candidate.stderr:
@@ -345,7 +416,7 @@ class TrnNki2LLMAgent(LLMAgent):
             stdout_lines = "\n".join(stdout_lines)
             prompt_text += stdout_lines
             prompt_text += "\n"
-        
+
         prompt_text += "\nPlease fix the code to address the errors while still applying the optimization plan. "
         prompt_text += "Make sure to follow these rules:\n"
         prompt_text += self._get_prompt_rules(planning=False, coding=True, prob=prob)
