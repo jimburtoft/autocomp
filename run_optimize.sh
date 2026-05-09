@@ -9,9 +9,12 @@
 
 set -e
 
-# PyTorch Native venv (created from DLC workspace wheels)
-# See AGENTS.md "PyTorch Native (TorchNeuron) Setup Guide" for setup.
-source $HOME/workspace/native_venv/bin/activate
+# SDK 2.29.1 NxDI venv (standard DLAMI) or PyTorch Native venv (DLC)
+if [ -d "$HOME/workspace/native_venv" ]; then
+    source $HOME/workspace/native_venv/bin/activate
+else
+    source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+fi
 export AWS_REGION=us-east-1
 export WANDB_MODE=disabled
 
