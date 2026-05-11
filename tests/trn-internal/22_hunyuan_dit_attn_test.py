@@ -37,10 +37,9 @@ Optimization opportunities:
 import numpy as np
 import math
 
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
+import nki
+import nki.language as nl
 import torch
-import torch_xla.core.xla_model as xm
 
 
 # Tile size constants
@@ -171,11 +170,11 @@ def test_nki(ref_func, test_func):
             torch.tensor(q_np), torch.tensor(k_np), torch.tensor(v_np), scale
         ).numpy()
 
-        # NKI on device (bf16 inputs on XLA device)
-        device = xm.xla_device()
-        q_dev = torch.tensor(q_np, dtype=torch.bfloat16).to(device)
-        k_dev = torch.tensor(k_np, dtype=torch.bfloat16).to(device)
-        v_dev = torch.tensor(v_np, dtype=torch.bfloat16).to(device)
+        # NKI on device (bf16 inputs on PyTorch Native device)
+        device = torch.device("neuron")
+        q_dev = torch.tensor(q_np, dtype=torch.bfloat16, device=device)
+        k_dev = torch.tensor(k_np, dtype=torch.bfloat16, device=device)
+        v_dev = torch.tensor(v_np, dtype=torch.bfloat16, device=device)
 
         result_ref = ref_func(q_dev, k_dev, v_dev)
         result_test = test_func(q_dev, k_dev, v_dev)
@@ -219,9 +218,9 @@ def benchmark_nki(nki_func):
     k_np = (np.random.randn(batch, d_head, seqlen) * 0.1).astype(np.float32)
     v_np = (np.random.randn(batch, seqlen, d_head) * 0.1).astype(np.float32)
 
-    q_dev = torch.tensor(q_np, dtype=torch.bfloat16).to(xm.xla_device())
-    k_dev = torch.tensor(k_np, dtype=torch.bfloat16).to(xm.xla_device())
-    v_dev = torch.tensor(v_np, dtype=torch.bfloat16).to(xm.xla_device())
+    q_dev = torch.tensor(q_np, dtype=torch.bfloat16, device=torch.device("neuron"))
+    k_dev = torch.tensor(k_np, dtype=torch.bfloat16, device=torch.device("neuron"))
+    v_dev = torch.tensor(v_np, dtype=torch.bfloat16, device=torch.device("neuron"))
 
     bench_func = nki.benchmark(warmup=2, iters=10)(nki_func)
     bench_func(q_dev, k_dev, v_dev)

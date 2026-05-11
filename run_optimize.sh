@@ -3,17 +3,21 @@
 # Usage: bash run_optimize.sh [prob_id]
 #   If prob_id is provided, runs only that kernel. Otherwise runs all listed.
 #
-# Environment: PyTorch Native (TorchNeuron) Beta 2 + NKI 0.3.0 (GA)
-# Setup: Follow PyTorch Native setup guide in AGENTS.md (extract DLC,
-#         install host runtime, create venv from workspace wheels)
+# Environment: PyTorch Native (TorchNeuron) Beta 2 + NKI 0.4.0b4
+# Setup: Use pre-built NKI Bootcamp AMI (us-west-2: ami-094f0450720125544)
+#         or follow PyTorch Native setup guide (extract DLC, install host
+#         runtime, create venv from workspace wheels)
 
 set -e
 
-# SDK 2.29.1 NxDI venv (standard DLAMI) or PyTorch Native venv (DLC)
-if [ -d "$HOME/workspace/native_venv" ]; then
+# PyTorch Native venv (pre-built AMI or DLC-extracted)
+if [ -d "$HOME/nki_bootcamp_venv" ]; then
+    source $HOME/nki_bootcamp_venv/bin/activate
+elif [ -d "$HOME/workspace/native_venv" ]; then
     source $HOME/workspace/native_venv/bin/activate
 else
-    source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+    echo "ERROR: No PyTorch Native venv found. Expected ~/nki_bootcamp_venv or ~/workspace/native_venv"
+    exit 1
 fi
 export AWS_REGION=us-east-1
 export WANDB_MODE=disabled
@@ -27,12 +31,12 @@ mkdir -p output
 pip install -e . -q 2>/dev/null
 
 # Kernels to optimize:
-#   21 = Cross-Entropy Loss (316 LOC, online LSE, float32, nki-library)
+#   22 = HunyuanVideo DiT Flash Attention (dense path, batch_heads=4, seqlen=4096, d=128)
 
 if [ -n "$1" ]; then
     KERNELS="$1"
 else
-    KERNELS="21"
+    KERNELS="22"
 fi
 
 # Warm-up: run each kernel's test harness once to trigger library rehydration

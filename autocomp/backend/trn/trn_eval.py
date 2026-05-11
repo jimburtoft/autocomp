@@ -245,7 +245,7 @@ if _target_func is None:
 import sys, json, os, traceback
 sys.path.insert(0, {repr(str(temp_dir.resolve()))})
 
-import neuronxcc.nki as nki
+import nki
 
 # === Test preamble ===
 {preamble}
@@ -400,10 +400,7 @@ print(json.dumps({{"compiled": os.path.exists(_neff_path), "error": _error_msg}}
 import sys, json, os, traceback
 sys.path.insert(0, {repr(str(temp_dir.resolve()))})
 
-try:
-    import nki
-except ImportError:
-    import neuronxcc.nki as nki
+import nki
 
 # === Test preamble ===
 {preamble}
@@ -457,38 +454,7 @@ print(json.dumps({{"compiled": os.path.exists(_neff_path), "error": _error_msg}}
                 + """\
 if __name__ == "__main__":
     import os
-    import hashlib
     import torch
-
-    # ---- Fix NKI compilation caching (safety net) ----
-    # Monkey-patch specialize_and_call to use deterministic temp paths.
-    # Without this on older NKI, every @nki.jit call recompiles (~1.3s)
-    # because random temp directories make each compilation cache key unique.
-    try:
-        import tempfile as _tempfile
-        from nki.compiler.backends.neuron.TraceKernel import TraceKernel
-        _orig_specialize = TraceKernel.specialize_and_call
-        _orig_named_tmp = _tempfile.NamedTemporaryFile
-
-        def _patched_specialize(self, boundargs):
-            fn = getattr(self.func, "__name__", "kernel")
-            sk = "".join(str(a.shape) + "_" for a in boundargs.args if hasattr(a, "shape"))
-            deterministic_prefix = hashlib.md5(f"{fn}_{sk}".encode()).hexdigest()[:12]
-            def _det_named_tmp(*args, prefix=None, **kwargs):
-                if prefix is not None:
-                    prefix = deterministic_prefix + "_" + prefix
-                else:
-                    prefix = deterministic_prefix + "_"
-                return _orig_named_tmp(*args, prefix=prefix, **kwargs)
-            _tempfile.NamedTemporaryFile = _det_named_tmp
-            try:
-                return _orig_specialize(self, boundargs)
-            finally:
-                _tempfile.NamedTemporaryFile = _orig_named_tmp
-
-        TraceKernel.specialize_and_call = _patched_specialize
-    except (ImportError, AttributeError):
-        pass
 
     # Phase 1: Correctness check (also triggers compilation + NEFF caching)
     test_result = test_nki(ref, test)
@@ -500,12 +466,20 @@ if __name__ == "__main__":
 
     # Find and output the NEFF path from compile cache.
     # neuron-profile will use this for device-only timing after this process exits.
+    # Check both PyTorch Native cache and standard neuron compile cache.
     import glob as _glob
-    _cache_dir = "/var/tmp/neuron-compile-cache"
-    _neff_files = sorted(
-        _glob.glob(f"{_cache_dir}/**/*.neff", recursive=True),
-        key=os.path.getmtime, reverse=True
-    )
+    _cache_dirs = [
+        "/var/tmp/neuron-compile-cache",
+        os.path.expanduser("~/.cache/neuron"),
+        "/tmp/neuron-compile-cache",
+    ]
+    _neff_files = []
+    for _cache_dir in _cache_dirs:
+        if os.path.isdir(_cache_dir):
+            _neff_files.extend(
+                _glob.glob(f"{_cache_dir}/**/*.neff", recursive=True)
+            )
+    _neff_files = sorted(_neff_files, key=os.path.getmtime, reverse=True)
     if _neff_files:
         print(f"NEFF_PATH: {_neff_files[0]}")
     else:
