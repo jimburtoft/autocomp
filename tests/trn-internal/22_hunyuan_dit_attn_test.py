@@ -230,6 +230,9 @@ def benchmark_nki(nki_func):
 
 
 if __name__ == "__main__":
+    # When run standalone (no SUBSTITUTE HERE), use ref as test
+    if "test" not in dir():
+        test = ref
     test_result = test_nki(ref, test)
     if not test_result:
         print("Test failed")
