@@ -262,7 +262,9 @@ def test_nki(ref_func, test_func):
 
 
 def benchmark_nki(nki_func):
-    """Latency benchmark using nki.benchmark."""
+    """Latency benchmark using wall-clock timing (PyTorch Native eager mode)."""
+    import time
+
     batch = BATCH_HEADS
     seqlen = SEQ_LEN
     d_head = D_HEAD
@@ -277,11 +279,18 @@ def benchmark_nki(nki_func):
     k_dev = torch.tensor(k_np, dtype=torch.bfloat16, device=device)
     v_dev = torch.tensor(v_np, dtype=torch.bfloat16, device=device)
 
-    bench_func = nki.benchmark(warmup=2, iters=10)(nki_func)
-    bench_func(q_dev, k_dev, v_dev)
-    latency_res = bench_func.benchmark_result.nc_latency
-    p99 = latency_res.get_latency_percentile(99)
-    print("Latency: {:.3f} ms (P99)".format(p99 / 1000.0))
+    # Warmup (includes first compilation if not cached)
+    for _ in range(3):
+        nki_func(q_dev, k_dev, v_dev)
+
+    # Timed iterations
+    iters = 20
+    start = time.perf_counter()
+    for _ in range(iters):
+        nki_func(q_dev, k_dev, v_dev)
+    elapsed = time.perf_counter() - start
+    avg_ms = (elapsed / iters) * 1000.0
+    print(f"Latency: {avg_ms:.3f} ms (avg over {iters} iters, wall-clock)")
 
 
 if __name__ == "__main__":
