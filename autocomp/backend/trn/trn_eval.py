@@ -34,6 +34,16 @@ class TrnEvalBackend(EvalBackend):
                 return line.split("NEFF_PATH:")[1].strip()
         return None
 
+    def _extract_wallclock_latency(self, stdout: str) -> float:
+        """Extract wall-clock latency from stdout using pattern 'WALLCLOCK_LATENCY_MS: <float>'"""
+        for line in stdout.split("\n"):
+            if "WALLCLOCK_LATENCY_MS:" in line:
+                try:
+                    return float(line.split("WALLCLOCK_LATENCY_MS:")[1].strip())
+                except (ValueError, IndexError):
+                    pass
+        return None
+
     def _profile_neff(self, neff_path: str, temp_dir: pathlib.Path, idx: int) -> float:
         """Profile a compiled NEFF using neuron-profile to get device-only timing.
 
@@ -445,8 +455,10 @@ print(json.dumps({{"compiled": os.path.exists(_neff_path), "error": _error_msg}}
         """
         test_code_i = test_code.replace("# SUBSTITUTE HERE", code_str)
 
-        # Replace the __main__ block with correctness check + NEFF extraction.
-        # Timing is handled externally by neuron-profile after this process exits.
+        # Replace the __main__ block with correctness check + in-process timing.
+        # PyTorch Native (eager mode) runs synchronously, so wall-clock timing
+        # after warmup is accurate. neuron-profile is attempted as a bonus after
+        # the subprocess exits but is not required.
         if "if __name__" in test_code_i:
             main_idx = test_code_i.index("if __name__")
             test_code_i = (
@@ -454,6 +466,7 @@ print(json.dumps({{"compiled": os.path.exists(_neff_path), "error": _error_msg}}
                 + """\
 if __name__ == "__main__":
     import os
+    import time
     import torch
 
     # Phase 1: Correctness check (also triggers compilation + NEFF caching)
@@ -464,11 +477,48 @@ if __name__ == "__main__":
     else:
         print("Test passed")
 
-    # Find and output the NEFF path from compile cache.
-    # neuron-profile will use this for device-only timing after this process exits.
-    # Check both PyTorch Native cache and standard neuron compile cache.
+    # Phase 2: Wall-clock timing (PyTorch Native is synchronous/eager).
+    # Time the test kernel only (not ref or comparison overhead).
+    import numpy as np
+    _WARMUP = 5
+    _ITERS = 20
+    _device = torch.device("neuron")
+
+    # Try to call test() directly with appropriate inputs.
+    # For attention kernels (problem 22+), shapes are defined as module constants.
+    try:
+        np.random.seed(99)
+        _batch = BATCH_HEADS if 'BATCH_HEADS' in dir() else 4
+        _seqlen = SEQ_LEN if 'SEQ_LEN' in dir() else 4096
+        _d_head = D_HEAD if 'D_HEAD' in dir() else 128
+        _q = torch.tensor(
+            (np.random.randn(_batch, _seqlen, _d_head) * 0.1).astype(np.float32),
+            dtype=torch.bfloat16, device=_device
+        )
+        _k = torch.tensor(
+            (np.random.randn(_batch, _d_head, _seqlen) * 0.1).astype(np.float32),
+            dtype=torch.bfloat16, device=_device
+        )
+        _v = torch.tensor(
+            (np.random.randn(_batch, _seqlen, _d_head) * 0.1).astype(np.float32),
+            dtype=torch.bfloat16, device=_device
+        )
+        # Warmup
+        for _ in range(_WARMUP):
+            test(_q, _k, _v)
+        _start = time.perf_counter()
+        for _ in range(_ITERS):
+            test(_q, _k, _v)
+        _elapsed = time.perf_counter() - _start
+        _avg_ms = (_elapsed / _ITERS) * 1000.0
+        print(f"WALLCLOCK_LATENCY_MS: {_avg_ms:.4f}")
+    except Exception as _e:
+        print(f"WARNING: Direct timing failed ({_e}), skipping wall-clock")
+
+    # Also try to find NEFF path for optional neuron-profile (bonus timing).
     import glob as _glob
     _cache_dirs = [
+        "/tmp/neff_cache",
         "/var/tmp/neuron-compile-cache",
         os.path.expanduser("~/.cache/neuron"),
         "/tmp/neuron-compile-cache",
@@ -527,8 +577,12 @@ if __name__ == "__main__":
 
         result_dict["correct"] = True
 
-        # Get device-only timing via neuron-profile (subprocess has exited,
-        # NeuronCores should be free).
+        # Extract wall-clock timing from subprocess (primary timing source
+        # for PyTorch Native where execution is synchronous/eager).
+        wallclock_latency = self._extract_wallclock_latency(p.stdout)
+
+        # Try neuron-profile for device-only timing (bonus, may fail on
+        # some AMIs due to arch mismatch or core contention).
         neff_path = self._extract_neff_path(p.stdout)
         device_latency = self._profile_neff(neff_path, temp_dir, idx)
 
@@ -538,13 +592,17 @@ if __name__ == "__main__":
                 f"(from neuron-profile)"
             )
             result_dict["latency"] = device_latency
+        elif wallclock_latency is not None:
+            logger.info(
+                f"Code {idx} wall-clock latency: {wallclock_latency:.4f} ms "
+                f"(from in-process timing, neuron-profile unavailable)"
+            )
+            result_dict["latency"] = wallclock_latency
         else:
             logger.warning(
-                f"Code {idx}: neuron-profile failed to produce device-only timing. "
-                f"NEFF path was: {neff_path}. "
-                f"Latency will be reported as None (no wall-clock fallback). "
-                f"Ensure /opt/aws/neuron/bin/neuron-profile is available and "
-                f"NeuronCores are not held by another process."
+                f"Code {idx}: No timing available. "
+                f"neuron-profile failed (NEFF path: {neff_path}), "
+                f"and no wall-clock timing was reported."
             )
 
         return result_dict
