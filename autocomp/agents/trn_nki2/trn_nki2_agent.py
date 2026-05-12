@@ -167,18 +167,23 @@ class TrnNki2LLMAgent(LLMAgent):
                 "The rewritten program should be semantically equivalent to the original program, within a small numerical tolerance.",
                 "Keep the same function name and signature as the original program (helper functions can be renamed or deleted).",
                 "Maintain correct tensor shapes and indexing patterns. Remember not to index with affine_range loop variables. Avoid loop carried dependencies.",
-                "The following imports have already been run: import nki; import nki.isa as nisa; import nki.language as nl; import numpy as np;",
+                "The following imports have already been run: import nki; import nki.isa as nisa; import nki.language as nl; import numpy as np; import torch;",
             ]
         )
         # NKI 0.4.0b4 compatibility rules (PyTorch Native Beta 2)
         rules.extend(
             [
-                "CRITICAL: Use ONLY the nl.* high-level API (nl.matmul, nl.exp, nl.max, nl.sum, nl.load, nl.store, nl.full, nl.zeros, nl.arange, nl.sequential_range, nl.affine_range, nl.ds). Do NOT use nisa.* ISA-level instructions (nisa.tensor_scalar, nisa.nc_matmul, nisa.activation, etc.) as they have broken scalar operations in this NKI version.",
-                "CRITICAL: nl.matmul does NOT accept a dtype= keyword argument. Use nl.matmul(x, y) only.",
-                "CRITICAL: For tensors used as accumulators across loop iterations (e.g., running_max, running_sum, out_acc), you MUST use in-place index update syntax: tensor[i_p, i_d] = new_value. Do NOT use reassignment (tensor = new_value) as this violates NKI scope rules. Define index tensors i_p = nl.arange(P)[:, None] and i_d = nl.arange(D)[None, :] before the loop.",
-                "CRITICAL: The partition dimension (first dimension of any tile in SBUF) cannot exceed 128. If you need to process more than 128 elements along the partition dimension, you must sub-tile into chunks of 128.",
-                "CRITICAL: Output tensors (returned from the kernel) must use buffer=nl.shared_hbm, NOT nl.hbm.",
-                "Use nl.sequential_range (not Python range()) for loops with data dependencies between iterations (e.g., KV loop in flash attention).",
+                "CRITICAL: Use the nisa.* ISA-level API with explicit buffer placement. Key functions: nisa.dma_copy(dst, src), nisa.nc_matmul(dst, stationary, moving), nisa.tensor_scalar(dst, data, op0, operand0), nisa.tensor_tensor(dst, data0, data1, op), nisa.activation(dst, op, data), nisa.tensor_reduce(dst, op, data, axis), nisa.tensor_copy(dst, src), nisa.memset(dst, value).",
+                "CRITICAL: Allocate ALL tiles with explicit buffer placement: nl.ndarray((P, F), dtype=..., buffer=nl.sbuf|nl.psum|nl.shared_hbm). Matmul results go to nl.psum, scalar/vector ops work on nl.sbuf, outputs go to nl.shared_hbm.",
+                "CRITICAL: nisa.tensor_tensor does NOT support broadcasting. Both operands must have the same free dimension size. For per-lane scaling (PMAX,1) over (PMAX,F), use nisa.tensor_scalar(dst, data, op0=nl.multiply, operand0=scale_tile) where scale_tile is (PMAX,1).",
+                "CRITICAL: nc_matmul requires BOTH inputs to be the same dtype (both bf16 or both float32). If one is float32 and other is bf16, cast first with nisa.tensor_copy.",
+                "CRITICAL: There is no divide operation. Use nisa.activation(inv, nl.reciprocal, x) then multiply.",
+                "CRITICAL: nc_transpose is limited to 32x32. For larger transposes, use PSUM destination or restructure the algorithm.",
+                "CRITICAL: No operator overloading (*, +, -, /) on tiles. Use explicit nisa.tensor_scalar or nisa.tensor_tensor calls.",
+                "CRITICAL: The partition dimension (first dimension of any tile in SBUF) cannot exceed 128.",
+                "CRITICAL: Output tensors (returned from the kernel) must use buffer=nl.shared_hbm.",
+                "Use nl.sequential_range (not Python range()) for loops with data dependencies between iterations (e.g., KV loop in flash attention). Use Python range() for compile-time-unrolled loops (e.g., V sub-tiles).",
+                "nisa.activation signature: activation(dst, op, data). nisa.tensor_reduce signature: tensor_reduce(dst, op, data, axis).",
             ]
         )
         if planning:

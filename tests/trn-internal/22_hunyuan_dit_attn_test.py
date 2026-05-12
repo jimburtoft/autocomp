@@ -1,5 +1,5 @@
 """
-HunyuanVideo-1.5 DiT Flash Attention (Dense Path) — NKI 0.3.0 kernel.
+HunyuanVideo-1.5 DiT Flash Attention (Dense Path) — NKI 0.4.0b4 kernel.
 
 The HunyuanVideo-1.5 DiT transformer uses 54 double-stream blocks, each
 performing joint attention over concatenated image + text tokens.
@@ -22,16 +22,13 @@ Layout:
   V: (batch_heads, seqlen_kv, d_head)  -- bf16
   Output: (batch_heads, seqlen_q, d_head) -- bf16
 
-Baseline device-only latency: 18.39 ms (neuron-profile, trn2.3xlarge LNC=2)
-  - Vector engine dominant (87%) -- softmax ops
-  - Tensor engine 27.6% -- matmul underutilized
-  - MFU: 1.2%
-
-Optimization opportunities:
-  - Reduce V sub-tile iterations (wider P@V accumulation)
-  - Fuse correction * out_acc + pv into single pass
-  - Pipeline K load with QK matmul
-  - Use nl.loop_reduce for sum/max fusion
+NKI 0.4.0b4 ISA-level style:
+  - Explicit buffer placement (sbuf, psum, shared_hbm)
+  - nisa.tensor_scalar for per-lane broadcasting (PMAX,1) over (PMAX,F)
+  - nisa.activation(dst, op, data) for exp, reciprocal
+  - nisa.tensor_reduce(dst, op, data, axis) for reductions
+  - nisa.nc_matmul for matrix multiply (bf16 inputs, fp32 psum output)
+  - No operator overloading (* + -), no nl.arange indexing
 """
 
 import numpy as np
@@ -39,6 +36,7 @@ import math
 
 import nki
 import nki.language as nl
+import nki.isa as nisa
 import torch
 
 
@@ -46,6 +44,7 @@ import torch
 PMAX = 128  # Partition dim = head_dim = 128
 K_TILE = 512  # K/V chunk size for flash attention tiling
 LARGE_NEG = -9984.0  # bf16-safe large negative
+SCALE = 1.0 / math.sqrt(128)  # Precomputed attention scale
 
 # HunyuanVideo-specific dimensions
 BATCH_HEADS = 4  # local heads per TP rank (16 heads / TP=4)
@@ -60,7 +59,7 @@ SEQ_LEN = 4096  # padded from 3500 (3180 img + 320 text) to 4096 for NKI alignme
 def ref(q_hbm, k_hbm, v_hbm):
     """Flash attention with fp32 online softmax for HunyuanVideo DiT.
 
-    NKI 0.3.0 nl API. Non-causal, bf16 I/O, fp32 softmax.
+    NKI 0.4.0b4 ISA API. Non-causal, bf16 I/O, fp32 softmax.
 
     Args:
         q_hbm: [batch, seqlen_q, d_head] bf16
@@ -71,7 +70,6 @@ def ref(q_hbm, k_hbm, v_hbm):
     """
     batch, seqlen_q, d_head = q_hbm.shape
     _, _, seqlen_kv = k_hbm.shape
-    scale = 1.0 / math.sqrt(d_head)
 
     n_q_tiles = seqlen_q // PMAX
     n_kv_chunks = seqlen_kv // K_TILE
@@ -84,63 +82,118 @@ def ref(q_hbm, k_hbm, v_hbm):
         for qt in nl.affine_range(n_q_tiles):
             q_offset = qt * PMAX
 
-            # Load Q tile [PMAX, d_head] and scale
-            q_idx = nl.arange(PMAX)[:, None]
-            d_idx = nl.arange(d_head)[None, :]
-            q_tile = nl.load(q_hbm[b, q_offset + q_idx, d_idx])
-            q_tile = q_tile * scale
-
-            # Index tensors for in-place updates (NKI 0.3.0 scoping)
-            i_p = nl.arange(PMAX)[:, None]
-            i_1 = nl.arange(1)[None, :]
-            i_d = nl.arange(d_head)[None, :]
+            # Load Q tile bf16, scale to fp32, cast back to bf16 for matmul
+            q_tile = nl.ndarray((PMAX, d_head), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=q_tile, src=q_hbm[b, nl.ds(q_offset, PMAX), :])
+            q_f32 = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(q_f32, q_tile, op0=nl.multiply, operand0=SCALE)
+            q_scaled = nl.ndarray((PMAX, d_head), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=q_scaled, src=q_f32)
 
             # Online softmax state
-            running_max = nl.full((PMAX, 1), fill_value=LARGE_NEG, dtype=nl.float32)
-            running_sum = nl.zeros((PMAX, 1), dtype=nl.float32)
-            out_acc = nl.zeros((PMAX, d_head), dtype=nl.float32)
+            running_max = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(running_max, LARGE_NEG)
+            running_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(running_sum, 0.0)
+            out_acc = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(out_acc, 0.0)
 
             for kv_idx in nl.sequential_range(n_kv_chunks):
                 kv_offset = kv_idx * K_TILE
 
-                # Load K^T chunk [d_head, K_TILE]
-                k_p_idx = nl.arange(d_head)[:, None]
-                k_f_idx = nl.arange(K_TILE)[None, :]
-                k_chunk = nl.load(k_hbm[b, k_p_idx, kv_offset + k_f_idx])
+                # Load K^T chunk [d_head, K_TILE] bf16
+                k_chunk = nl.ndarray(
+                    (d_head, K_TILE), dtype=nl.bfloat16, buffer=nl.sbuf
+                )
+                nisa.dma_copy(dst=k_chunk, src=k_hbm[b, :, nl.ds(kv_offset, K_TILE)])
 
-                # Q @ K -> scores [PMAX, K_TILE]
-                scores = nl.matmul(q_tile, k_chunk)
+                # QK matmul: bf16 @ bf16 -> fp32 in PSUM
+                scores = nl.ndarray((PMAX, K_TILE), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(scores, q_scaled, k_chunk)
 
-                # Online softmax
-                chunk_max = nl.max(scores, axis=[1])
-                new_max = nl.maximum(running_max, chunk_max)
-                correction = nl.exp(running_max - new_max)
+                # Copy scores to SBUF
+                scores_sbuf = nl.ndarray(
+                    (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.tensor_copy(dst=scores_sbuf, src=scores)
 
-                # Rescale accumulators (in-place for NKI 0.3.0 scoping)
-                running_sum[i_p, i_1] = running_sum * correction
-                out_acc[i_p, i_d] = out_acc * correction
+                # Online softmax: chunk_max
+                chunk_max = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_reduce(chunk_max, nl.max, scores_sbuf, axis=(1,))
+
+                # new_max
+                new_max = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(new_max, running_max, chunk_max, op=nl.maximum)
+
+                # correction = exp(running_max - new_max)
+                max_diff = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(max_diff, running_max, new_max, op=nl.subtract)
+                correction = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(correction, nl.exp, max_diff)
+
+                # Rescale: tensor_scalar broadcasts (PMAX,1) over (PMAX,F)
+                nisa.tensor_scalar(
+                    out_acc, out_acc, op0=nl.multiply, operand0=correction
+                )
+                nisa.tensor_scalar(
+                    running_sum, running_sum, op0=nl.multiply, operand0=correction
+                )
 
                 # exp(scores - new_max)
-                exp_scores = nl.exp(scores - new_max)
-                chunk_sum = nl.sum(exp_scores, axis=[1])
-                running_sum[i_p, i_1] = running_sum + chunk_sum
-                running_max[i_p, i_1] = new_max
+                scores_shifted = nl.ndarray(
+                    (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.tensor_scalar(
+                    scores_shifted, scores_sbuf, op0=nl.subtract, operand0=new_max
+                )
+                exp_scores = nl.ndarray(
+                    (PMAX, K_TILE), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.activation(exp_scores, nl.exp, scores_shifted)
 
-                # P @ V in sub-tiles of PMAX (partition limit = 128)
-                n_v_tiles = K_TILE // PMAX  # 4
-                for vt in range(n_v_tiles):
-                    v_tile_offset = kv_offset + vt * PMAX
-                    vt_p_idx = nl.arange(PMAX)[:, None]
-                    vt_f_idx = nl.arange(d_head)[None, :]
-                    v_tile = nl.load(v_hbm[b, v_tile_offset + vt_p_idx, vt_f_idx])
+                # chunk_sum
+                chunk_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_reduce(chunk_sum, nl.add, exp_scores, axis=(1,))
+                nisa.tensor_tensor(running_sum, running_sum, chunk_sum, op=nl.add)
 
-                    p_slice = exp_scores[:, nl.ds(vt * PMAX, PMAX)]
-                    pv_tile = nl.matmul(p_slice, v_tile)
-                    out_acc[i_p, i_d] = out_acc + pv_tile
+                # Update running_max
+                nisa.tensor_copy(dst=running_max, src=new_max)
 
-            # Final normalization and store
-            out_normalized = out_acc / running_sum
-            nl.store(output[b, q_offset + q_idx, d_idx], value=out_normalized)
+                # P @ V in sub-tiles (K_TILE / PMAX = 4)
+                for vt in range(K_TILE // PMAX):
+                    v_offset = kv_offset + vt * PMAX
+                    v_tile = nl.ndarray(
+                        (PMAX, d_head), dtype=nl.bfloat16, buffer=nl.sbuf
+                    )
+                    nisa.dma_copy(dst=v_tile, src=v_hbm[b, nl.ds(v_offset, PMAX), :])
+
+                    # Cast P-slice to bf16 for matmul
+                    p_slice = nl.ndarray((PMAX, PMAX), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(
+                        dst=p_slice, src=exp_scores[:, nl.ds(vt * PMAX, PMAX)]
+                    )
+                    p_bf16 = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=p_bf16, src=p_slice)
+
+                    # P@V matmul
+                    pv = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(pv, p_bf16, v_tile)
+                    pv_sbuf = nl.ndarray(
+                        (PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    nisa.tensor_copy(dst=pv_sbuf, src=pv)
+                    nisa.tensor_tensor(out_acc, out_acc, pv_sbuf, op=nl.add)
+
+            # Normalize: out_acc * reciprocal(running_sum)
+            inv_sum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(inv_sum, nl.reciprocal, running_sum)
+            out_norm = nl.ndarray((PMAX, d_head), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(out_norm, out_acc, op0=nl.multiply, operand0=inv_sum)
+
+            # Cast to bf16 and store
+            out_bf16 = nl.ndarray((PMAX, d_head), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=out_bf16, src=out_norm)
+            nisa.dma_copy(dst=output[b, nl.ds(q_offset, PMAX), :], src=out_bf16)
 
     return output
 
@@ -157,7 +210,9 @@ def test_nki(ref_func, test_func):
     batch = BATCH_HEADS
     seqlen = SEQ_LEN
     d_head = D_HEAD
-    scale = 1.0 / math.sqrt(d_head)
+    scale = SCALE
+
+    device = torch.device("neuron")
 
     for seed in range(2):
         np.random.seed(42 + seed)
@@ -170,8 +225,7 @@ def test_nki(ref_func, test_func):
             torch.tensor(q_np), torch.tensor(k_np), torch.tensor(v_np), scale
         ).numpy()
 
-        # NKI on device (bf16 inputs on PyTorch Native device)
-        device = torch.device("neuron")
+        # NKI on device (bf16 inputs)
         q_dev = torch.tensor(q_np, dtype=torch.bfloat16, device=device)
         k_dev = torch.tensor(k_np, dtype=torch.bfloat16, device=device)
         v_dev = torch.tensor(v_np, dtype=torch.bfloat16, device=device)
@@ -208,19 +262,20 @@ def test_nki(ref_func, test_func):
 
 
 def benchmark_nki(nki_func):
-    """Latency benchmark using nki.benchmark (monkey-patched by trn_eval.py)."""
+    """Latency benchmark using nki.benchmark."""
     batch = BATCH_HEADS
     seqlen = SEQ_LEN
     d_head = D_HEAD
 
+    device = torch.device("neuron")
     np.random.seed(42)
     q_np = (np.random.randn(batch, seqlen, d_head) * 0.1).astype(np.float32)
     k_np = (np.random.randn(batch, d_head, seqlen) * 0.1).astype(np.float32)
     v_np = (np.random.randn(batch, seqlen, d_head) * 0.1).astype(np.float32)
 
-    q_dev = torch.tensor(q_np, dtype=torch.bfloat16, device=torch.device("neuron"))
-    k_dev = torch.tensor(k_np, dtype=torch.bfloat16, device=torch.device("neuron"))
-    v_dev = torch.tensor(v_np, dtype=torch.bfloat16, device=torch.device("neuron"))
+    q_dev = torch.tensor(q_np, dtype=torch.bfloat16, device=device)
+    k_dev = torch.tensor(k_np, dtype=torch.bfloat16, device=device)
+    v_dev = torch.tensor(v_np, dtype=torch.bfloat16, device=device)
 
     bench_func = nki.benchmark(warmup=2, iters=10)(nki_func)
     bench_func(q_dev, k_dev, v_dev)
